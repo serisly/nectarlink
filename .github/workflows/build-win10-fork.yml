@@ -35,7 +35,8 @@ jobs:
           $code = $LASTEXITCODE
           $out | ForEach-Object { Write-Host $_ }
           if ($code -ne 0) {
-            ($out | Select-String -Pattern '(^|\s)(error(\[E\d+\])?:|panicked at|test .* FAILED)' -Context 0,3 | Where-Object { $_.Line -notmatch '\.\.\. ok$' } | ForEach-Object {
+            $clean = $out | ForEach-Object { ([string]$_) -replace '\x1b\[[0-9;]*m', '' }
+            ($clean | Select-String -Pattern '(^|\s)(error(\[E\d+\])?:|panicked at|test .* FAILED)' -Context 0,3 | Where-Object { $_.Line -notmatch '\.\.\. ok$' } | ForEach-Object {
               $_.Line
               $_.Context.PostContext
             }) | Where-Object { $_ -and $_.Trim() -ne '' } | Select-Object -First 10 | ForEach-Object {

@@ -6057,8 +6057,9 @@ mod seen_on_lan_tests {
 #[cfg(test)]
 mod usb_teardown_tests {
     use super::*;
+    use crate::Photo;
     use crate::config::NoopPlatform;
-    use nectarlink_protocol::messages::{DeviceInfo, DeviceKind, Photo};
+    use nectarlink_protocol::messages::{DeviceInfo, DeviceKind};
     use std::sync::atomic::{AtomicBool, Ordering};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
