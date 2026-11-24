@@ -993,12 +993,10 @@ impl Shared {
                     session.close(CLOSE_NORMAL, b"usb replaced");
                 } else {
                     self.publish_online(&session);
-                    if replaced_port.is_some() {
-                        let shared = self.clone();
-                        tokio::spawn(async move {
-                            crate::session::probe_after_network_change(&shared, &session).await;
-                        });
-                    }
+                    let shared = self.clone();
+                    tokio::spawn(async move {
+                        crate::session::probe_after_network_change(&shared, &session).await;
+                    });
                 }
             }
             self.wake_supervisor(&peer);
@@ -6053,5 +6051,301 @@ mod seen_on_lan_tests {
         // Outside the private ranges: only an mDNS sighting makes it home.
         assert!(!crate::session::is_lan_ip(ip));
         assert!(crate::session::is_lan_peer_ip(ip, &[addr]));
+    }
+}
+
+#[cfg(test)]
+mod usb_teardown_tests {
+    use super::*;
+    use crate::config::NoopPlatform;
+    use nectarlink_protocol::messages::{DeviceInfo, DeviceKind, Photo};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    async fn start_usb_node(
+        dir: &tempfile::TempDir,
+        name: &str,
+        kind: DeviceKind,
+        usb_port: Option<u16>,
+        caps: &[&str],
+    ) -> Node {
+        let mut config = NodeConfig::new(
+            dir.path().to_path_buf(),
+            DeviceInfo {
+                name: name.into(),
+                kind,
+                os: "windows".into(),
+                os_ver: "11".into(),
+                model: None,
+                accent: None,
+                screen: None,
+                install_id: None,
+            },
+            "0.0.0-test",
+        );
+        config.lan_discovery = false;
+        config.away_mode = false;
+        config.localsend_port = 0;
+        config.usb_port = usb_port;
+        config.adb_server = None;
+        config.capabilities = caps.iter().map(|c| (*c).to_owned()).collect();
+        Node::start(config, Arc::new(NoopPlatform)).await.unwrap()
+    }
+
+    async fn wait_event<T>(
+        rx: &mut broadcast::Receiver<NodeEvent>,
+        label: &str,
+        mut pred: impl FnMut(&NodeEvent) -> Option<T>,
+    ) -> T {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                match rx.recv().await {
+                    Ok(ev) => {
+                        if let Some(found) = pred(&ev) {
+                            return found;
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(e) => panic!("{label}: event channel closed: {e:?}"),
+                }
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("timed out waiting for {label}"))
+    }
+
+    async fn wait_usb_online(node: &Node, rx: &mut broadcast::Receiver<NodeEvent>, peer: DeviceId) {
+        if node.paired_devices().unwrap().iter().any(|d| {
+            d.id == peer && matches!(d.link, LinkState::Online { path: ConnectionPath::Usb, .. })
+        }) {
+            return;
+        }
+        wait_event(rx, "online over USB", |ev| match ev {
+            NodeEvent::LinkChanged { device, link: LinkState::Online { path: ConnectionPath::Usb, .. } }
+                if *device == peer =>
+            {
+                Some(())
+            }
+            _ => None,
+        })
+        .await;
+    }
+
+    async fn start_controllable_usb_proxy(
+        upstream: SocketAddr,
+    ) -> (SocketAddr, tokio::sync::oneshot::Sender<()>, tokio::sync::oneshot::Sender<()>) {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (blackhole_tx, blackhole_rx) = tokio::sync::oneshot::channel::<()>();
+        let (close_tx, mut close_rx) = tokio::sync::oneshot::channel::<()>();
+        tokio::spawn(async move {
+            let Ok((client, _)) = listener.accept().await else { return };
+            let Ok(server) = tokio::net::TcpStream::connect(upstream).await else { return };
+            let (mut cr, mut cw) = client.into_split();
+            let (mut sr, mut sw) = server.into_split();
+            let blackholed = Arc::new(AtomicBool::new(false));
+            let bh1 = blackholed.clone();
+            let bh2 = blackholed.clone();
+            let c2s = tokio::spawn(async move {
+                let mut buf = [0u8; 8192];
+                while let Ok(n) = cr.read(&mut buf).await {
+                    if n == 0 {
+                        break;
+                    }
+                    if !bh1.load(Ordering::Relaxed) && sw.write_all(&buf[..n]).await.is_err() {
+                        break;
+                    }
+                }
+            });
+            let s2c = tokio::spawn(async move {
+                let mut buf = [0u8; 8192];
+                while let Ok(n) = sr.read(&mut buf).await {
+                    if n == 0 {
+                        break;
+                    }
+                    if !bh2.load(Ordering::Relaxed) && cw.write_all(&buf[..n]).await.is_err() {
+                        break;
+                    }
+                }
+            });
+            let blackholed_first = tokio::select! {
+                _ = blackhole_rx => true,
+                _ = &mut close_rx => false,
+            };
+            if blackholed_first {
+                blackholed.store(true, Ordering::Relaxed);
+                let _ = close_rx.await;
+            }
+            c2s.abort();
+            s2c.abort();
+            let _ = c2s.await;
+            let _ = s2c.await;
+        });
+        (addr, blackhole_tx, close_tx)
+    }
+
+    /// Pairs two nodes over USB, wipes persisted LAN addresses, and restarts both
+    /// with fresh endpoints so the subsequent session must establish strictly over
+    /// the controllable USB proxy rather than a cached same-host LAN address.
+    async fn pair_and_restart_usb_only(
+        pc_caps: &[&str],
+        phone_caps: &[&str],
+    ) -> (tempfile::TempDir, tempfile::TempDir, Node, Node) {
+        let pc_dir = tempfile::TempDir::new().unwrap();
+        let phone_dir = tempfile::TempDir::new().unwrap();
+
+        let phone = start_usb_node(&phone_dir, "Pixel", DeviceKind::Phone, Some(0), phone_caps).await;
+        let pc = start_usb_node(&pc_dir, "Desktop", DeviceKind::Desktop, None, pc_caps).await;
+        let (pc_id, phone_id) = (pc.device_id(), phone.device_id());
+        let mut pc_ev = pc.events();
+        let mut phone_ev = phone.events();
+
+        let usb_port = phone.usb_port().unwrap();
+        pc.connect_usb_tunnel(([127, 0, 0, 1], usb_port).into()).await.unwrap();
+        wait_event(&mut pc_ev, "pc sas", |ev| {
+            matches!(ev, NodeEvent::Pairing(PairingEvent::SasCode { .. })).then_some(())
+        })
+        .await;
+        wait_event(&mut phone_ev, "phone sas", |ev| {
+            matches!(ev, NodeEvent::Pairing(PairingEvent::SasCode { .. })).then_some(())
+        })
+        .await;
+        pc.pairing_confirm(true).unwrap();
+        phone.pairing_confirm(true).unwrap();
+        wait_usb_online(&pc, &mut pc_ev, phone_id).await;
+        wait_usb_online(&phone, &mut phone_ev, pc_id).await;
+
+        pc.shared.store.record_seen(&phone_id, crate::now_unix(), &[]).unwrap();
+        phone.shared.store.record_seen(&pc_id, crate::now_unix(), &[]).unwrap();
+        pc.shutdown().await;
+        phone.shutdown().await;
+
+        let phone = start_usb_node(&phone_dir, "Pixel", DeviceKind::Phone, Some(0), phone_caps).await;
+        let pc = start_usb_node(&pc_dir, "Desktop", DeviceKind::Desktop, None, pc_caps).await;
+        (pc_dir, phone_dir, pc, phone)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn usb_tunnel_disconnect_closes_stranded_session_immediately() {
+        let (_pc_dir, _phone_dir, pc, phone) = pair_and_restart_usb_only(&[], &[]).await;
+        let (pc_id, phone_id) = (pc.device_id(), phone.device_id());
+        let mut pc_ev = pc.events();
+        let mut phone_ev = phone.events();
+
+        let (proxy_addr, _blackhole_tx, close_tx) =
+            start_controllable_usb_proxy(([127, 0, 0, 1], phone.usb_port().unwrap()).into()).await;
+        pc.connect_usb_tunnel(proxy_addr).await.unwrap();
+        wait_usb_online(&pc, &mut pc_ev, phone_id).await;
+        wait_usb_online(&phone, &mut phone_ev, pc_id).await;
+
+        let bridge_port = pc.shared.usb_peer_addr(&phone_id).expect("active usb bridge").port();
+        let session = pc.shared.session(&phone_id).expect("active usb session");
+        assert!(
+            session.is_bound_to_usb_bridge_port(bridge_port),
+            "fresh USB session should record bridge port {bridge_port}"
+        );
+
+        let started = std::time::Instant::now();
+        let _ = close_tx.send(());
+        wait_event(&mut pc_ev, "usb session offline", |ev| match ev {
+            NodeEvent::LinkChanged { device, link: LinkState::Offline { .. } } if *device == phone_id => {
+                Some(())
+            }
+            _ => None,
+        })
+        .await;
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "expected immediate USB disconnect teardown, took {:?}",
+            started.elapsed()
+        );
+        assert!(!session.is_alive(), "stranded USB session must be closed on disconnect");
+        assert!(
+            !session.uses_usb_bridge_port(bridge_port),
+            "legacy map-based lookup returns false once port is unregistered"
+        );
+        assert!(
+            session.is_bound_to_usb_bridge_port(bridge_port),
+            "recorded bridge port still identifies the closed USB session"
+        );
+
+        pc.shutdown().await;
+        phone.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn usb_tunnel_replacement_closes_stranded_session_and_delivers_photo() {
+        let (_pc_dir, _phone_dir, pc, phone) =
+            pair_and_restart_usb_only(&[crate::PHOTOS_SHOW], &[crate::PHOTOS_READ]).await;
+        let (pc_id, phone_id) = (pc.device_id(), phone.device_id());
+        let mut pc_ev = pc.events();
+        let mut phone_ev = phone.events();
+
+        let direct_usb: SocketAddr = ([127, 0, 0, 1], phone.usb_port().unwrap()).into();
+        let (proxy_addr, blackhole_tx, _close_tx) = start_controllable_usb_proxy(direct_usb).await;
+        pc.connect_usb_tunnel(proxy_addr).await.unwrap();
+        wait_usb_online(&pc, &mut pc_ev, phone_id).await;
+        wait_usb_online(&phone, &mut phone_ev, pc_id).await;
+        while pc_ev.try_recv().is_ok() {}
+
+        let old_port = pc.shared.usb_peer_addr(&phone_id).expect("initial usb bridge").port();
+        let old_session = pc.shared.session(&phone_id).expect("initial usb session");
+        assert!(
+            old_session.is_bound_to_usb_bridge_port(old_port),
+            "initial USB session should record bridge port {old_port}"
+        );
+
+        // Blackhole proxy #1 without closing TCP, then immediately attach a fresh tunnel.
+        let _ = blackhole_tx.send(());
+        let started = std::time::Instant::now();
+        pc.connect_usb_tunnel(direct_usb).await.unwrap();
+
+        let photo = Photo {
+            id: "media:wobble".into(),
+            name: "Screenshot_wobble.jpg".into(),
+            size: 12_345,
+            taken: 1_795_514_000,
+            screenshot: true,
+            thumb: vec![0xff, 0xd8, 0xff],
+        };
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(6);
+        let mut ticker = tokio::time::interval(Duration::from_millis(200));
+        let mut got = None;
+        while tokio::time::Instant::now() < deadline {
+            tokio::select! {
+                _ = ticker.tick() => {
+                    let _ = phone.photo_taken(photo.clone()).await;
+                }
+                ev = pc_ev.recv() => {
+                    if let Ok(NodeEvent::PhotoAdded { device, photo: received }) = ev
+                        && device == phone_id
+                    {
+                        got = Some(received);
+                        break;
+                    }
+                }
+                _ = tokio::time::sleep_until(deadline) => break,
+            }
+        }
+        assert!(
+            !old_session.is_alive(),
+            "old USB session on port {old_port} must be closed immediately on tunnel replacement"
+        );
+        let new_session = pc.shared.session(&phone_id).expect("replacement usb session");
+        assert!(!Arc::ptr_eq(&old_session, &new_session), "session must be replaced");
+        assert_eq!(
+            got,
+            Some(photo),
+            "screenshot was not delivered over replacement USB tunnel within {:?}",
+            started.elapsed()
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(6),
+            "USB replacement took {:?}, expected well under heartbeat timeout",
+            started.elapsed()
+        );
+
+        pc.shutdown().await;
+        phone.shutdown().await;
     }
 }
