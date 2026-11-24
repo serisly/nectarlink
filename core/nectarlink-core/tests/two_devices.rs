@@ -8932,16 +8932,12 @@ async fn report_parts_come_at_once_and_logs_only_when_shared() {
 /// (simulating a wedged ADB forward during a brief USB bounce).
 async fn start_controllable_usb_proxy(
     upstream: SocketAddr,
-) -> (
-    SocketAddr,
-    tokio::sync::oneshot::Sender<()>,
-    tokio::sync::oneshot::Sender<()>,
-) {
+) -> (SocketAddr, tokio::sync::oneshot::Sender<()>, tokio::sync::oneshot::Sender<()>) {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
     let addr = listener.local_addr().unwrap();
-    let (blackhole_tx, mut blackhole_rx) = tokio::sync::oneshot::channel::<()>();
-    let (close_tx, close_rx) = tokio::sync::oneshot::channel::<()>();
+    let (blackhole_tx, blackhole_rx) = tokio::sync::oneshot::channel::<()>();
+    let (close_tx, mut close_rx) = tokio::sync::oneshot::channel::<()>();
     tokio::spawn(async move {
         let Ok((client, _)) = listener.accept().await else { return };
         let Ok(server) = tokio::net::TcpStream::connect(upstream).await else { return };
@@ -8972,12 +8968,13 @@ async fn start_controllable_usb_proxy(
                 }
             }
         });
-        tokio::select! {
-            _ = &mut blackhole_rx => {
-                blackholed.store(true, std::sync::atomic::Ordering::Relaxed);
-                let _ = close_rx.await;
-            }
-            _ = close_rx => {}
+        let blackholed_first = tokio::select! {
+            _ = blackhole_rx => true,
+            _ = &mut close_rx => false,
+        };
+        if blackholed_first {
+            blackholed.store(true, std::sync::atomic::Ordering::Relaxed);
+            let _ = close_rx.await;
         }
         c2s.abort();
         s2c.abort();

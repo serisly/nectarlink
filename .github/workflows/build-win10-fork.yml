@@ -30,7 +30,16 @@ jobs:
 
       - name: Run core and vcam unit tests
         shell: pwsh
-        run: cargo test --locked -p nectarlink-core -p nectarlink-vcam
+        run: |
+          $out = cargo test --locked -p nectarlink-core -p nectarlink-vcam 2>&1
+          $code = $LASTEXITCODE
+          $out | ForEach-Object { Write-Host $_ }
+          if ($code -ne 0) {
+            $out | Where-Object { $_ -match 'error(\[E\d+\])?:|FAILED|panicked' } | Select-Object -First 25 | ForEach-Object {
+              Write-Host "::error::$_"
+            }
+            exit $code
+          }
 
       - name: Install Qt
         uses: jurplel/install-qt-action@v4
