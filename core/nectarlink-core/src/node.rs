@@ -993,6 +993,12 @@ impl Shared {
                     session.close(CLOSE_NORMAL, b"usb replaced");
                 } else {
                     self.publish_online(&session);
+                    if replaced_port.is_some() {
+                        let shared = self.clone();
+                        tokio::spawn(async move {
+                            crate::session::probe_after_network_change(&shared, &session).await;
+                        });
+                    }
                 }
             }
             self.wake_supervisor(&peer);
@@ -1086,7 +1092,11 @@ impl Shared {
         });
     }
 
-    pub(crate) async fn on_usb_tunnel_disconnected(&self, peer: DeviceId, bridge_addr: SocketAddr) {
+    pub(crate) async fn on_usb_tunnel_disconnected(
+        self: &Arc<Self>,
+        peer: DeviceId,
+        bridge_addr: SocketAddr,
+    ) {
         let bridge_port = bridge_addr.port();
         lock(&self.usb_pending).remove(&bridge_port);
         let removed = {
@@ -1143,6 +1153,10 @@ impl Shared {
                 session.close(CLOSE_NORMAL, b"usb disconnected");
             } else {
                 self.publish_online(&session);
+                let shared = self.clone();
+                tokio::spawn(async move {
+                    crate::session::probe_after_network_change(&shared, &session).await;
+                });
             }
         }
         self.endpoint.network_change().await;

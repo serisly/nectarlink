@@ -9011,12 +9011,13 @@ async fn usb_tunnel_disconnect_closes_stranded_session_immediately() {
         LinkState::Online { path: ConnectionPath::Usb, .. }
     ));
 
-    // Cut the USB tunnel: `on_usb_tunnel_disconnected` must close the stranded
-    // session immediately rather than waiting 11.5-18.5s for heartbeat timeout.
+    // Cut the USB tunnel: `on_usb_tunnel_disconnected` must close a stranded
+    // USB session promptly (immediately if bound to the port, or via the 2s
+    // reachability probe) rather than waiting 11.5-18.5s for heartbeat timeout.
     let started = std::time::Instant::now();
     let _ = close_tx.send(());
     let mut seen = Vec::new();
-    let closed = tokio::time::timeout(Duration::from_secs(4), async {
+    let closed = tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             match pc.events.recv().await {
                 Ok(NodeEvent::LinkChanged { device, link }) if device == phone_id => {
@@ -9032,13 +9033,15 @@ async fn usb_tunnel_disconnect_closes_stranded_session_immediately() {
         }
     })
     .await;
+    if closed.is_err() {
+        let ring_res = tokio::time::timeout(Duration::from_secs(2), pc.node.ring(phone_id, true)).await;
+        panic!(
+            "USB session did not close on tunnel disconnect (seen={seen:?}, link={:?}, ring={ring_res:?})",
+            pc.node.paired_devices().ok()
+        );
+    }
     assert!(
-        closed.is_ok(),
-        "USB session did not close on tunnel disconnect (seen={seen:?}, link={:?})",
-        pc.node.paired_devices().ok()
-    );
-    assert!(
-        started.elapsed() < Duration::from_secs(4),
+        started.elapsed() < Duration::from_secs(5),
         "expected fast USB disconnect teardown, took {:?}",
         started.elapsed()
     );
