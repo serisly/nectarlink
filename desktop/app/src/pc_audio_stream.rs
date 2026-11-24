@@ -39,22 +39,140 @@ mod imp {
     #![allow(unsafe_code)]
 
     use std::{
+        collections::VecDeque,
         sync::atomic::{AtomicBool, Ordering},
         time::Duration,
     };
+    #[cfg(windows)]
+    use std::time::Instant;
 
     #[cfg(windows)]
-    use windows::Win32::{
-        Media::Audio::{
-            AUDCLNT_BUFFERFLAGS_SILENT, AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_LOOPBACK,
-            IAudioCaptureClient, IAudioClient, IMMDeviceEnumerator, MMDeviceEnumerator, WAVEFORMATEX,
-            eConsole, eRender,
+    use windows::{
+        Win32::{
+            Foundation::PROPERTYKEY,
+            Media::Audio::{
+                AUDCLNT_BUFFERFLAGS_SILENT, AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM,
+                AUDCLNT_STREAMFLAGS_LOOPBACK, AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY, DEVICE_STATE_ACTIVE,
+                IAudioCaptureClient, IAudioClient, IMMDevice, IMMDeviceEnumerator, MMDeviceEnumerator,
+                WAVEFORMATEX, eConsole, eRender,
+            },
+            System::{
+                Com::{
+                    CLSCTX_ALL, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx, CoTaskMemFree,
+                    STGM_READ,
+                },
+                Threading::{GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_TIME_CRITICAL},
+                Variant::VT_UI4,
+            },
         },
-        System::{
-            Com::{CLSCTX_ALL, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx, CoTaskMemFree},
-            Threading::{GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_TIME_CRITICAL},
-        },
+        core::{GUID, HSTRING, PWSTR},
     };
+
+    /// Windows `EndpointFormFactor::LineLevel` (2) marks internal virtual routing/mic buses
+    /// rather than user playback buses.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    const FORM_FACTOR_LINE_LEVEL: u32 = 2;
+    /// Uniform capture rate (48 kHz) used for multi-channel virtual mixer loopback and
+    /// WASAPI `AUTOCONVERTPCM` downmixing.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    const MIX_RATE: u32 = 48_000;
+    /// 10 ms at 48 kHz = 480 stereo frames (960 interleaved `f32` samples).
+    #[cfg_attr(not(windows), allow(dead_code))]
+    const MIX_TICK_FRAMES: usize = 480;
+    #[cfg_attr(not(windows), allow(dead_code))]
+    const MIX_TICK_SAMPLES: usize = MIX_TICK_FRAMES * 2;
+    /// Hard 40 ms cap per stream queue so clock drift across virtual channels never accumulates latency.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    const MAX_QUEUE_SAMPLES: usize = MIX_TICK_SAMPLES * 4;
+
+    #[cfg_attr(not(windows), allow(dead_code))]
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct RenderEndpointInfo {
+        id: String,
+        instance_id: String,
+        form_factor: Option<u32>,
+    }
+
+    /// True when Windows enumerates the render endpoint under the root software
+    /// media bus (`ROOT\MEDIA\...`), as virtual audio mixers (Sonar, Voicemeeter,
+    /// Wave Link, VB-Cable, etc.) do.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    fn is_virtual_audio_instance(instance_id: &str) -> bool {
+        instance_id.to_ascii_uppercase().contains(r"ROOT\MEDIA\")
+    }
+
+    /// Chooses which active Windows render endpoints to loop back.
+    ///
+    /// - Hardware default output (`HDAUDIO\`, `INTELAUDIO\`, `BTHENUM\`, `USB\`):
+    ///   captures only the default endpoint.
+    /// - Virtual mixer default output (`ROOT\MEDIA\...`): captures the default endpoint
+    ///   plus every sibling virtual playback endpoint, excluding `LineLevel` internal
+    ///   routing/mic buses and excluding physical hardware outputs so mixed audio is
+    ///   never captured twice.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    fn select_loopback_endpoint_ids(default_id: &str, all_active: &[RenderEndpointInfo]) -> Vec<String> {
+        let Some(default_info) = all_active.iter().find(|e| e.id == default_id) else {
+            return vec![default_id.to_owned()];
+        };
+        if !is_virtual_audio_instance(&default_info.instance_id) {
+            return vec![default_id.to_owned()];
+        }
+        let mut selected = vec![default_id.to_owned()];
+        for ep in all_active {
+            if ep.id == default_id {
+                continue;
+            }
+            if is_virtual_audio_instance(&ep.instance_id) && ep.form_factor != Some(FORM_FACTOR_LINE_LEVEL) {
+                selected.push(ep.id.clone());
+            }
+        }
+        selected
+    }
+
+    /// Real-time 10 ms stereo mixer across multiple asynchronous WASAPI loopback streams.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    struct StereoStreamMixer {
+        queues: Vec<VecDeque<f32>>,
+    }
+
+    #[cfg_attr(not(windows), allow(dead_code))]
+    impl StereoStreamMixer {
+        fn new(count: usize) -> Self {
+            Self {
+                queues: (0..count).map(|_| VecDeque::with_capacity(MAX_QUEUE_SAMPLES)).collect(),
+            }
+        }
+
+        /// Enqueues non-silent interleaved stereo `f32` samples for stream `idx`.
+        /// Silent packets are skipped so idle channels never stall active ones.
+        fn push_stereo(&mut self, idx: usize, samples: &[f32]) {
+            let Some(q) = self.queues.get_mut(idx) else { return };
+            if !samples.iter().any(|&s| s.is_finite() && s.abs() > 1e-5) {
+                return;
+            }
+            q.extend(samples.iter().map(|&s| if s.is_finite() { s } else { 0.0 }));
+            if q.len() > MAX_QUEUE_SAMPLES {
+                let drop_count = (q.len() - MIX_TICK_SAMPLES * 2) & !1;
+                q.drain(..drop_count);
+            }
+        }
+
+        /// Pops and sums one 10 ms (`MIX_TICK_SAMPLES`) stereo tick across all active channels.
+        /// Returns `None` when every channel queue is empty.
+        fn pop_mixed_tick(&mut self) -> Option<Vec<f32>> {
+            if self.queues.iter().all(VecDeque::is_empty) {
+                return None;
+            }
+            let mut mixed = vec![0.0_f32; MIX_TICK_SAMPLES];
+            for q in &mut self.queues {
+                let take = q.len().min(MIX_TICK_SAMPLES);
+                for (dst, src) in mixed.iter_mut().take(take).zip(q.drain(..take)) {
+                    *dst += src;
+                }
+            }
+            Some(mixed)
+        }
+    }
 
     use crate::core_host;
 
@@ -793,7 +911,7 @@ mod imp {
     fn open_capture(
         without_own: bool,
     ) -> Result<(IAudioClient, IAudioCaptureClient, u32, usize, u16), String> {
-        use windows::Win32::Media::Audio::{AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM, WAVE_FORMAT_PCM};
+        use windows::Win32::Media::Audio::WAVE_FORMAT_PCM;
         let own_left_out = if without_own { process_loopback_client().map(Some) } else { Ok(None) };
         match own_left_out {
             Ok(None) => {}
@@ -860,6 +978,224 @@ mod imp {
         }
     }
 
+    /// `PKEY_Device_InstanceId` (`{b3f8fa53-0004-438e-9003-51a46e139bfc}, 2`).
+    #[cfg(windows)]
+    const PKEY_DEVICE_INSTANCE_ID: PROPERTYKEY =
+        PROPERTYKEY { fmtid: GUID::from_u128(0xb3f8fa53_0004_438e_9003_51a46e139bfc), pid: 2 };
+    /// `PKEY_AudioEndpoint_FormFactor` (`{1da5d803-d492-4edd-8c23-e0c0ffee7f0e}, 0`).
+    #[cfg(windows)]
+    const PKEY_AUDIO_ENDPOINT_FORM_FACTOR: PROPERTYKEY =
+        PROPERTYKEY { fmtid: GUID::from_u128(0x1da5d803_d492_4edd_8c23_e0c0ffee7f0e), pid: 0 };
+    #[cfg(windows)]
+    const WAVE_FORMAT_IEEE_FLOAT: u16 = 3;
+
+    #[cfg(windows)]
+    fn device_id_string(device: &IMMDevice) -> Option<String> {
+        // SAFETY: `GetId` returns a task-allocated wide string freed with `CoTaskMemFree`.
+        unsafe {
+            let raw: PWSTR = device.GetId().ok()?;
+            if raw.is_null() {
+                return None;
+            }
+            let s = raw.to_string().ok();
+            CoTaskMemFree(Some(raw.0 as *const _));
+            s.filter(|id| !id.is_empty())
+        }
+    }
+
+    #[cfg(windows)]
+    fn default_render_endpoint_id(enumerator: &IMMDeviceEnumerator) -> Option<String> {
+        // SAFETY: Read-only Core Audio default render endpoint lookup.
+        unsafe { enumerator.GetDefaultAudioEndpoint(eRender, eConsole).ok().and_then(|d| device_id_string(&d)) }
+    }
+
+    #[cfg(windows)]
+    fn propvariant_u32(prop: &windows::Win32::System::Com::StructuredStorage::PROPVARIANT) -> Option<u32> {
+        // SAFETY: Reads `ulVal` only when the PROPVARIANT discriminant is `VT_UI4`.
+        unsafe {
+            if prop.Anonymous.Anonymous.vt == VT_UI4 {
+                Some(prop.Anonymous.Anonymous.Anonymous.ulVal)
+            } else {
+                prop.to_string().trim().parse::<u32>().ok()
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    fn active_render_endpoints(enumerator: &IMMDeviceEnumerator) -> Vec<RenderEndpointInfo> {
+        // SAFETY: Read-only enumeration of active Core Audio render endpoints and their properties.
+        unsafe {
+            let Ok(collection) = enumerator.EnumAudioEndpoints(eRender, DEVICE_STATE_ACTIVE) else {
+                return Vec::new();
+            };
+            let count = collection.GetCount().unwrap_or(0);
+            let mut out = Vec::with_capacity(count as usize);
+            for i in 0..count {
+                let Ok(dev) = collection.Item(i) else { continue };
+                let Some(id) = device_id_string(&dev) else { continue };
+                let (instance_id, form_factor) = match dev.OpenPropertyStore(STGM_READ) {
+                    Ok(store) => {
+                        let inst = store
+                            .GetValue(&PKEY_DEVICE_INSTANCE_ID)
+                            .ok()
+                            .map(|p| p.to_string())
+                            .unwrap_or_default();
+                        let form = store
+                            .GetValue(&PKEY_AUDIO_ENDPOINT_FORM_FACTOR)
+                            .ok()
+                            .and_then(|p| propvariant_u32(&p));
+                        (inst, form)
+                    }
+                    Err(_) => (String::new(), None),
+                };
+                out.push(RenderEndpointInfo { id, instance_id, form_factor });
+            }
+            out
+        }
+    }
+
+    #[cfg(windows)]
+    fn open_endpoint_stereo_f32(
+        enumerator: &IMMDeviceEnumerator,
+        id: &str,
+    ) -> Result<(IAudioClient, IAudioCaptureClient), String> {
+        let format = WAVEFORMATEX {
+            wFormatTag: WAVE_FORMAT_IEEE_FLOAT,
+            nChannels: 2,
+            nSamplesPerSec: MIX_RATE,
+            nAvgBytesPerSec: MIX_RATE * 8,
+            nBlockAlign: 8,
+            wBitsPerSample: 32,
+            cbSize: 0,
+        };
+        // SAFETY: Shared-mode WASAPI loopback with Windows format conversion & 7.1->stereo downmix.
+        unsafe {
+            let device = enumerator.GetDevice(&HSTRING::from(id)).map_err(|e| e.to_string())?;
+            let client: IAudioClient = device.Activate(CLSCTX_ALL, None).map_err(|e| e.to_string())?;
+            client
+                .Initialize(
+                    AUDCLNT_SHAREMODE_SHARED,
+                    AUDCLNT_STREAMFLAGS_LOOPBACK
+                        | AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM
+                        | AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY,
+                    100_000,
+                    0,
+                    &format,
+                    None,
+                )
+                .map_err(|e| e.to_string())?;
+            let capture: IAudioCaptureClient = client.GetService().map_err(|e| e.to_string())?;
+            client.Start().map_err(|e| e.to_string())?;
+            Ok((client, capture))
+        }
+    }
+
+    #[cfg(windows)]
+    enum CaptureBackend {
+        Single {
+            client: IAudioClient,
+            capture: IAudioCaptureClient,
+            rate: u32,
+            channels: usize,
+            bits_per_sample: u16,
+        },
+        Multi {
+            clients: Vec<(IAudioClient, IAudioCaptureClient)>,
+            rate: u32,
+        },
+    }
+
+    #[cfg(windows)]
+    impl CaptureBackend {
+        fn rate(&self) -> u32 {
+            match self {
+                Self::Single { rate, .. } | Self::Multi { rate, .. } => *rate,
+            }
+        }
+
+        fn stop_all(&self) {
+            // SAFETY: Stops every WASAPI client initialized on this thread before dropping.
+            unsafe {
+                match self {
+                    Self::Single { client, .. } => {
+                        let _ = client.Stop();
+                    }
+                    Self::Multi { clients, .. } => {
+                        for (client, _) in clients {
+                            let _ = client.Stop();
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    fn open_capture_set(
+        enumerator: &IMMDeviceEnumerator,
+        without_own: bool,
+    ) -> Result<(CaptureBackend, Option<String>), String> {
+        let initial_default = default_render_endpoint_id(enumerator);
+        if without_own {
+            let (client, capture, rate, channels, bits_per_sample) = open_capture(true)?;
+            return Ok((
+                CaptureBackend::Single { client, capture, rate, channels, bits_per_sample },
+                initial_default,
+            ));
+        }
+        if let Some(ref def_id) = initial_default {
+            let active = active_render_endpoints(enumerator);
+            let ids = select_loopback_endpoint_ids(def_id, &active);
+            if ids.len() > 1 {
+                let mut clients = Vec::with_capacity(ids.len());
+                for id in &ids {
+                    match open_endpoint_stereo_f32(enumerator, id) {
+                        Ok(pair) => clients.push(pair),
+                        Err(e) => tracing::debug!(endpoint = %id, error = %e, "skipped virtual loopback endpoint"),
+                    }
+                }
+                if clients.len() > 1 {
+                    tracing::info!(
+                        endpoints = clients.len(),
+                        "PC audio loopback mixing virtual audio mixer channels at {} Hz stereo",
+                        MIX_RATE
+                    );
+                    return Ok((CaptureBackend::Multi { clients, rate: MIX_RATE }, initial_default));
+                }
+                if let Some((client, capture)) = clients.pop() {
+                    return Ok((
+                        CaptureBackend::Single {
+                            client,
+                            capture,
+                            rate: MIX_RATE,
+                            channels: 2,
+                            bits_per_sample: 32,
+                        },
+                        initial_default,
+                    ));
+                }
+            } else if let Some(id) = ids.first()
+                && let Ok((client, capture)) = open_endpoint_stereo_f32(enumerator, id)
+            {
+                return Ok((
+                    CaptureBackend::Single {
+                        client,
+                        capture,
+                        rate: MIX_RATE,
+                        channels: 2,
+                        bits_per_sample: 32,
+                    },
+                    initial_default,
+                ));
+            }
+        }
+        let (client, capture, rate, channels, bits_per_sample) = open_capture(false)?;
+        Ok((
+            CaptureBackend::Single { client, capture, rate, channels, bits_per_sample },
+            initial_default,
+        ))
+    }
+
     #[cfg(windows)]
     fn capture_and_stream_once() -> Result<(), String> {
         let node = core_host::node().ok_or_else(|| "core node not running".to_owned())?;
@@ -876,8 +1212,12 @@ mod imp {
             return Ok(());
         };
 
+        // SAFETY: COM is initialized on the worker thread in `run_loopback_worker`.
+        let enumerator: IMMDeviceEnumerator =
+            unsafe { CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL) }.map_err(|e| e.to_string())?;
         let without_own = crate::win::audio_out::playing();
-        let (client, capture, rate, channels, bits_per_sample) = open_capture(without_own)?;
+        let (backend, initial_default) = open_capture_set(&enumerator, without_own)?;
+        let rate = backend.rate();
 
         let mut enhancer = SpeakerEnhancer::new(rate);
         let (tx, mut rx) = tokio::sync::mpsc::channel::<(u32, u8, Vec<u8>)>(64);
@@ -897,6 +1237,12 @@ mod imp {
         // Keep sending zero-filled PCM for ~500 ms after audible audio stops so brief
         // pauses between words or beats never starve the phone's AudioTrack ringbuffer.
         let mut silence_tail_packets: u32 = 0;
+        let mut last_default_check = Instant::now();
+        let mut mixer = match &backend {
+            CaptureBackend::Multi { clients, .. } => Some(StereoStreamMixer::new(clients.len())),
+            CaptureBackend::Single { .. } => None,
+        };
+        let mut next_mix = Instant::now() + Duration::from_millis(10);
 
         'capture: while is_enabled() {
             std::thread::sleep(Duration::from_millis(2));
@@ -910,74 +1256,165 @@ mod imp {
             if crate::win::audio_out::playing() != without_own {
                 break 'capture;
             }
-            // SAFETY: Drain available capture packets from `IAudioCaptureClient`.
-            unsafe {
-                loop {
-                    let Ok(packet_frames) = capture.GetNextPacketSize() else { break };
-                    if packet_frames == 0 {
-                        break;
-                    }
-                    let mut data_ptr: *mut u8 = std::ptr::null_mut();
-                    let mut frames_to_read: u32 = 0;
-                    let mut flags: u32 = 0;
-                    if capture.GetBuffer(&mut data_ptr, &mut frames_to_read, &mut flags, None, None).is_err()
-                    {
-                        break;
-                    }
-                    let silent = (flags & (AUDCLNT_BUFFERFLAGS_SILENT.0 as u32)) != 0 || data_ptr.is_null();
-                    let frames = frames_to_read as usize;
-                    let pcm_bytes = if silent {
-                        if silence_tail_packets > 0 {
-                            silence_tail_packets -= 1;
-                            vec![0u8; frames * 4]
-                        } else {
-                            Vec::new()
-                        }
-                    } else if bits_per_sample == 32 {
-                        let floats = std::slice::from_raw_parts(data_ptr.cast::<f32>(), frames * channels);
-                        let has_signal = floats.iter().any(|&s| s.is_finite() && s.abs() > 1e-5);
-                        if has_signal {
-                            silence_tail_packets = 50;
-                            enhancer.encode_stereo_f32(floats, channels)
-                        } else if silence_tail_packets > 0 {
-                            silence_tail_packets -= 1;
-                            vec![0u8; frames * 4]
-                        } else {
-                            Vec::new()
-                        }
-                    } else if bits_per_sample == 16 {
-                        let i16s = std::slice::from_raw_parts(data_ptr.cast::<i16>(), frames * channels);
-                        let has_signal = i16s.iter().any(|&s| s.unsigned_abs() > 2);
-                        if has_signal {
-                            silence_tail_packets = 50;
-                            enhancer.encode_stereo_i16(i16s, channels)
-                        } else if silence_tail_packets > 0 {
-                            silence_tail_packets -= 1;
-                            vec![0u8; frames * 4]
-                        } else {
-                            Vec::new()
-                        }
-                    } else {
-                        Vec::new()
-                    };
-                    let _ = capture.ReleaseBuffer(frames_to_read);
+            // Re-open automatically if Windows' default output endpoint switched.
+            if !without_own && last_default_check.elapsed() >= Duration::from_secs(1) {
+                last_default_check = Instant::now();
+                if default_render_endpoint_id(&enumerator) != initial_default {
+                    tracing::info!("default Windows audio output changed; reconnecting PC audio loopback");
+                    break 'capture;
+                }
+            }
 
-                    if !pcm_bytes.is_empty()
-                        && matches!(
-                            tx.try_send((rate, 2, pcm_bytes)),
-                            Err(tokio::sync::mpsc::error::TrySendError::Closed(_))
-                        )
-                    {
+            match &backend {
+                CaptureBackend::Single { capture, channels, bits_per_sample, .. } => {
+                    let channels = *channels;
+                    let bits_per_sample = *bits_per_sample;
+                    // SAFETY: Drain available capture packets from `IAudioCaptureClient`.
+                    unsafe {
+                        loop {
+                            let Ok(packet_frames) = capture.GetNextPacketSize() else {
+                                break 'capture;
+                            };
+                            if packet_frames == 0 {
+                                break;
+                            }
+                            let mut data_ptr: *mut u8 = std::ptr::null_mut();
+                            let mut frames_to_read: u32 = 0;
+                            let mut flags: u32 = 0;
+                            if capture
+                                .GetBuffer(&mut data_ptr, &mut frames_to_read, &mut flags, None, None)
+                                .is_err()
+                            {
+                                break 'capture;
+                            }
+                            let silent =
+                                (flags & (AUDCLNT_BUFFERFLAGS_SILENT.0 as u32)) != 0 || data_ptr.is_null();
+                            let frames = frames_to_read as usize;
+                            let pcm_bytes = if silent {
+                                if silence_tail_packets > 0 {
+                                    silence_tail_packets -= 1;
+                                    vec![0u8; frames * 4]
+                                } else {
+                                    Vec::new()
+                                }
+                            } else if bits_per_sample == 32 {
+                                let floats =
+                                    std::slice::from_raw_parts(data_ptr.cast::<f32>(), frames * channels);
+                                let has_signal = floats.iter().any(|&s| s.is_finite() && s.abs() > 1e-5);
+                                if has_signal {
+                                    silence_tail_packets = 50;
+                                    enhancer.encode_stereo_f32(floats, channels)
+                                } else if silence_tail_packets > 0 {
+                                    silence_tail_packets -= 1;
+                                    vec![0u8; frames * 4]
+                                } else {
+                                    Vec::new()
+                                }
+                            } else if bits_per_sample == 16 {
+                                let i16s =
+                                    std::slice::from_raw_parts(data_ptr.cast::<i16>(), frames * channels);
+                                let has_signal = i16s.iter().any(|&s| s.unsigned_abs() > 2);
+                                if has_signal {
+                                    silence_tail_packets = 50;
+                                    enhancer.encode_stereo_i16(i16s, channels)
+                                } else if silence_tail_packets > 0 {
+                                    silence_tail_packets -= 1;
+                                    vec![0u8; frames * 4]
+                                } else {
+                                    Vec::new()
+                                }
+                            } else {
+                                Vec::new()
+                            };
+                            let _ = capture.ReleaseBuffer(frames_to_read);
+
+                            if !pcm_bytes.is_empty()
+                                && matches!(
+                                    tx.try_send((rate, 2, pcm_bytes)),
+                                    Err(tokio::sync::mpsc::error::TrySendError::Closed(_))
+                                )
+                            {
+                                break 'capture;
+                            }
+                        }
+                    }
+                }
+                CaptureBackend::Multi { clients, .. } => {
+                    let Some(mixer) = mixer.as_mut() else {
                         break 'capture;
+                    };
+                    let mut failed_clients = 0usize;
+                    // SAFETY: Drain each active virtual playback endpoint's 48 kHz stereo f32 packets.
+                    unsafe {
+                        for (idx, (_, capture)) in clients.iter().enumerate() {
+                            loop {
+                                let Ok(packet_frames) = capture.GetNextPacketSize() else {
+                                    failed_clients += 1;
+                                    break;
+                                };
+                                if packet_frames == 0 {
+                                    break;
+                                }
+                                let mut data_ptr: *mut u8 = std::ptr::null_mut();
+                                let mut frames_to_read: u32 = 0;
+                                let mut flags: u32 = 0;
+                                if capture
+                                    .GetBuffer(&mut data_ptr, &mut frames_to_read, &mut flags, None, None)
+                                    .is_err()
+                                {
+                                    failed_clients += 1;
+                                    break;
+                                }
+                                let silent = (flags & (AUDCLNT_BUFFERFLAGS_SILENT.0 as u32)) != 0
+                                    || data_ptr.is_null();
+                                if !silent && frames_to_read > 0 {
+                                    let floats = std::slice::from_raw_parts(
+                                        data_ptr.cast::<f32>(),
+                                        frames_to_read as usize * 2,
+                                    );
+                                    mixer.push_stereo(idx, floats);
+                                }
+                                let _ = capture.ReleaseBuffer(frames_to_read);
+                            }
+                        }
+                    }
+                    if failed_clients >= clients.len() {
+                        break 'capture;
+                    }
+
+                    // Emit mixed 10 ms stereo frames at exact real-time cadence.
+                    let now = Instant::now();
+                    if now.saturating_duration_since(next_mix) > Duration::from_millis(50) {
+                        next_mix = now;
+                    }
+                    for _ in 0..2 {
+                        if now < next_mix {
+                            break;
+                        }
+                        next_mix += Duration::from_millis(10);
+                        let pcm_bytes = if let Some(mixed) = mixer.pop_mixed_tick() {
+                            silence_tail_packets = 50;
+                            enhancer.encode_stereo_f32(&mixed, 2)
+                        } else if silence_tail_packets > 0 {
+                            silence_tail_packets -= 1;
+                            vec![0u8; MIX_TICK_FRAMES * 4]
+                        } else {
+                            Vec::new()
+                        };
+                        if !pcm_bytes.is_empty()
+                            && matches!(
+                                tx.try_send((rate, 2, pcm_bytes)),
+                                Err(tokio::sync::mpsc::error::TrySendError::Closed(_))
+                            )
+                        {
+                            break 'capture;
+                        }
                     }
                 }
             }
         }
 
-        // SAFETY: Stop the WASAPI client before dropping.
-        unsafe {
-            let _ = client.Stop();
-        }
+        backend.stop_all();
         Ok(())
     }
 
@@ -1128,6 +1565,116 @@ mod imp {
             let encoded_i16 = enhancer.encode_stereo_i16(&i16s, 2);
             assert_eq!(encoded_i16.len(), 2 * 4);
             assert!(encoded_i16.iter().any(|&b| b != 0));
+        }
+
+        #[test]
+        fn virtual_mixer_selection_includes_sibling_playback_channels_and_skips_line_level_and_hardware() {
+            let endpoints = vec![
+                RenderEndpointInfo {
+                    id: "gaming".into(),
+                    instance_id: r"{1}.ROOT\MEDIA\0000".into(),
+                    form_factor: Some(3),
+                },
+                RenderEndpointInfo {
+                    id: "media".into(),
+                    instance_id: r"{1}.ROOT\MEDIA\0000".into(),
+                    form_factor: Some(3),
+                },
+                RenderEndpointInfo {
+                    id: "chat".into(),
+                    instance_id: r"{1}.ROOT\MEDIA\0000".into(),
+                    form_factor: Some(5),
+                },
+                RenderEndpointInfo {
+                    id: "voicemeeter_aux".into(),
+                    instance_id: r"{1}.ROOT\MEDIA\0002".into(),
+                    form_factor: Some(1),
+                },
+                RenderEndpointInfo {
+                    id: "stream_bus".into(),
+                    instance_id: r"{1}.ROOT\MEDIA\0000".into(),
+                    form_factor: Some(FORM_FACTOR_LINE_LEVEL),
+                },
+                RenderEndpointInfo {
+                    id: "hdmi_monitor".into(),
+                    instance_id: r"{1}.HDAUDIO\FUNC_01&VEN_10DE".into(),
+                    form_factor: Some(9),
+                },
+                RenderEndpointInfo {
+                    id: "realtek".into(),
+                    instance_id: r"{1}.INTELAUDIO\FUNC_01".into(),
+                    form_factor: Some(1),
+                },
+            ];
+            let picked = select_loopback_endpoint_ids("gaming", &endpoints);
+            assert_eq!(picked, vec!["gaming", "media", "chat", "voicemeeter_aux"]);
+        }
+
+        #[test]
+        fn hardware_default_output_captures_only_default_endpoint() {
+            let endpoints = vec![
+                RenderEndpointInfo {
+                    id: "realtek".into(),
+                    instance_id: r"{1}.INTELAUDIO\FUNC_01".into(),
+                    form_factor: Some(1),
+                },
+                RenderEndpointInfo {
+                    id: "virtual_media".into(),
+                    instance_id: r"{1}.ROOT\MEDIA\0000".into(),
+                    form_factor: Some(3),
+                },
+            ];
+            assert_eq!(select_loopback_endpoint_ids("realtek", &endpoints), vec!["realtek"]);
+        }
+
+        #[test]
+        fn stereo_stream_mixer_sums_simultaneous_channels_and_ignores_silence() {
+            let mut mixer = StereoStreamMixer::new(3);
+            // Silent packets on channel 0 must not produce output.
+            mixer.push_stereo(0, &[0.0; MIX_TICK_SAMPLES]);
+            assert!(mixer.pop_mixed_tick().is_none());
+
+            // Channel 1 (e.g. Media) + Channel 2 (e.g. Gaming) playing simultaneously sum cleanly.
+            let mut ch1 = vec![0.0_f32; MIX_TICK_SAMPLES];
+            let mut ch2 = vec![0.0_f32; MIX_TICK_SAMPLES];
+            ch1[0] = 0.25;
+            ch1[1] = -0.10;
+            ch2[0] = 0.30;
+            ch2[1] = 0.40;
+            mixer.push_stereo(1, &ch1);
+            mixer.push_stereo(2, &ch2);
+
+            let tick = mixer.pop_mixed_tick().expect("mixed tick");
+            assert_eq!(tick.len(), MIX_TICK_SAMPLES);
+            assert!((tick[0] - 0.55).abs() < 1e-6);
+            assert!((tick[1] - 0.30).abs() < 1e-6);
+            assert!(mixer.pop_mixed_tick().is_none());
+        }
+
+        #[test]
+        fn stereo_stream_mixer_caps_queue_drift_with_stereo_alignment() {
+            let mut mixer = StereoStreamMixer::new(1);
+            let mut chunk = vec![0.0_f32; MIX_TICK_SAMPLES];
+            for i in 0..MIX_TICK_FRAMES {
+                chunk[i * 2] = 0.25;
+                chunk[i * 2 + 1] = -0.25;
+            }
+            for _ in 0..8 {
+                mixer.push_stereo(0, &chunk);
+            }
+            assert!(mixer.queues[0].len() <= MAX_QUEUE_SAMPLES);
+            assert_eq!(mixer.queues[0].len() % 2, 0);
+            let tick = mixer.pop_mixed_tick().expect("aligned tick");
+            assert!((tick[0] - 0.25).abs() < 1e-6);
+            assert!((tick[1] - (-0.25)).abs() < 1e-6);
+        }
+
+        #[cfg(windows)]
+        #[test]
+        fn propvariant_u32_extracts_form_factor() {
+            use windows::Win32::System::Com::StructuredStorage::PROPVARIANT;
+            assert_eq!(propvariant_u32(&PROPVARIANT::from(FORM_FACTOR_LINE_LEVEL)), Some(2));
+            assert_eq!(propvariant_u32(&PROPVARIANT::from(3u32)), Some(3));
         }
     }
 }

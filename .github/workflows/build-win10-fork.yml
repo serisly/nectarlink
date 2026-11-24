@@ -1,10 +1,10 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
-name: Build Windows 10 Fork Installer
+name: Build Windows Fork Installer
 
 on:
   push:
     branches:
-      - win10-webcam
+      - main
   workflow_dispatch:
 
 permissions:
@@ -42,17 +42,20 @@ jobs:
           cache: true
           aqtsource: git+https://github.com/miurahr/aqtinstall.git@5a49f2b391ae8ee1d3c0dd87f8b33c1d49a4deb7
 
-      - name: Run desktop vcam unit tests
+      - name: Run desktop vcam and audio unit tests
         shell: pwsh
         run: |
-          $out = cargo test --locked -p nectarlink-desktop win::vcam 2>&1
-          $code = $LASTEXITCODE
-          $out | ForEach-Object { Write-Host $_ }
-          if ($code -ne 0) {
-            $out | Where-Object { $_ -match 'error(\[E\d+\])?:|FAILED|panicked' } | Select-Object -First 25 | ForEach-Object {
-              Write-Host "::error::$_"
+          foreach ($filter in @("win::vcam", "pc_audio_stream")) {
+            Write-Host "=== cargo test $filter ==="
+            $out = cargo test --locked -p nectarlink-desktop $filter 2>&1
+            $code = $LASTEXITCODE
+            $out | ForEach-Object { Write-Host $_ }
+            if ($code -ne 0) {
+              $out | Where-Object { $_ -match 'error(\[E\d+\])?:|FAILED|panicked' } | Select-Object -First 25 | ForEach-Object {
+                Write-Host "::error::$_"
+              }
+              exit $code
             }
-            exit $code
           }
 
       - name: Install NSIS
@@ -98,8 +101,8 @@ jobs:
       - name: Publish fork release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: win10-vcam-latest
-          name: "NectarLink Win10 Webcam Fork (${{ github.sha }})"
+          tag_name: fork-latest
+          name: "NectarLink Windows Fork (${{ github.sha }})"
           prerelease: true
           make_latest: false
           files: |
