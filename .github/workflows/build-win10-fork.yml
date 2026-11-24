@@ -44,7 +44,16 @@ jobs:
 
       - name: Run desktop vcam unit tests
         shell: pwsh
-        run: cargo test --locked -p nectarlink-desktop win::vcam
+        run: |
+          $out = cargo test --locked -p nectarlink-desktop win::vcam 2>&1
+          $code = $LASTEXITCODE
+          $out | ForEach-Object { Write-Host $_ }
+          if ($code -ne 0) {
+            $out | Where-Object { $_ -match 'error(\[E\d+\])?:|FAILED|panicked' } | Select-Object -First 25 | ForEach-Object {
+              Write-Host "::error::$_"
+            }
+            exit $code
+          }
 
       - name: Install NSIS
         shell: pwsh
@@ -52,7 +61,16 @@ jobs:
 
       - name: Build Windows x64 installer
         shell: pwsh
-        run: ./scripts/package.ps1
+        run: |
+          $out = & ./scripts/package.ps1 2>&1
+          $code = $LASTEXITCODE
+          $out | ForEach-Object { Write-Host $_ }
+          if ($code -ne 0) {
+            $out | Where-Object { $_ -match 'error(\[E\d+\])?:|throw|failed|missing' } | Select-Object -First 25 | ForEach-Object {
+              Write-Host "::error::$_"
+            }
+            exit $code
+          }
 
       - name: Smoke-test installer
         shell: pwsh

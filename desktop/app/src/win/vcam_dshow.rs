@@ -25,8 +25,8 @@ use windows::{
             },
             Registry::{HKEY_LOCAL_MACHINE, RRF_RT_REG_SZ, RegGetValueW},
             Threading::{
-                CreateEventW, EVENT_MODIFY_STATE, OpenEventW, OpenMutexW, ReleaseMutex, SetEvent,
-                WaitForSingleObject,
+                CreateEventW, EVENT_MODIFY_STATE, OpenEventW, OpenMutexW, ReleaseMutex,
+                SYNCHRONIZATION_ACCESS_RIGHTS, SetEvent, WaitForSingleObject,
             },
         },
     },
@@ -43,7 +43,7 @@ const DLL_64: &str = "UnityCaptureFilter64.dll";
 const DLL_32: &str = "UnityCaptureFilter32.dll";
 
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-const SYNCHRONIZE_RIGHT: u32 = 0x0010_0000;
+const SYNCHRONIZE_RIGHT: SYNCHRONIZATION_ACCESS_RIGHTS = SYNCHRONIZATION_ACCESS_RIGHTS(0x0010_0000);
 const MUTEX_WAIT_MS: u32 = 50;
 const REOPEN_BACKOFF: Duration = Duration::from_millis(150);
 
