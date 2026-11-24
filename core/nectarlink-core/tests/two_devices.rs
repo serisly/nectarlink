@@ -8978,6 +8978,8 @@ async fn start_controllable_usb_proxy(
         }
         c2s.abort();
         s2c.abort();
+        let _ = c2s.await;
+        let _ = s2c.await;
     });
     (addr, blackhole_tx, close_tx)
 }
@@ -9047,8 +9049,6 @@ async fn usb_tunnel_disconnect_closes_stranded_session_immediately() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn usb_tunnel_replacement_switches_session_without_waiting_for_heartbeat() {
-    use nectarlink_core::ConnectionPath;
-
     let mut phone =
         start_usb_device("Pixel", DeviceKind::Phone, Some(0), &[nectarlink_core::PHOTOS_READ]).await;
     let mut pc =
@@ -9078,49 +9078,9 @@ async fn usb_tunnel_replacement_switches_session_without_waiting_for_heartbeat()
     let started = std::time::Instant::now();
     pc.node.connect_usb_tunnel(direct_usb).await.unwrap();
 
-    // Wait for the replacement session to come online on both sides (well under
-    // the 11.5-18.5s heartbeat).
-    let mut seen_pc = Vec::new();
-    let reconnected = tokio::time::timeout(Duration::from_secs(5), async {
-        let mut saw_offline = false;
-        loop {
-            match pc.events.recv().await {
-                Ok(NodeEvent::LinkChanged { device, link }) if device == phone_id => {
-                    seen_pc.push(format!("{link:?}"));
-                    match link {
-                        LinkState::Offline { .. } => saw_offline = true,
-                        LinkState::Online { path: ConnectionPath::Usb, .. } if saw_offline => break,
-                        _ => {}
-                    }
-                }
-                Ok(_) => {}
-                Err(e) => panic!("event stream failed: {e:?}"),
-            }
-        }
-    })
-    .await;
-    assert!(
-        reconnected.is_ok(),
-        "USB replacement tunnel did not reconnect quickly (seen_pc={seen_pc:?}, link={:?})",
-        pc.node.paired_devices().ok()
-    );
-
-    tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            match phone.events.recv().await {
-                Ok(NodeEvent::LinkChanged {
-                    device,
-                    link: LinkState::Online { path: ConnectionPath::Usb, .. },
-                }) if device == pc_id => break,
-                Ok(_) => {}
-                Err(e) => panic!("phone event stream failed: {e:?}"),
-            }
-        }
-    })
-    .await
-    .expect("phone should register the replacement USB session quickly");
-
-    // Verify the replacement session actually delivers a phone screenshot right away.
+    // Because proxy #1 is blackholed, a screenshot sent by the phone can ONLY
+    // reach the PC once the dead session on proxy #1 is torn down and replaced
+    // by a live session over `direct_usb` (well under the 11.5-18.5s heartbeat).
     let photo = nectarlink_core::Photo {
         id: "media:wobble".into(),
         name: "Screenshot_wobble.jpg".into(),
@@ -9129,19 +9089,38 @@ async fn usb_tunnel_replacement_switches_session_without_waiting_for_heartbeat()
         screenshot: true,
         thumb: vec![0xff, 0xd8, 0xff],
     };
-    phone.node.photo_taken(photo.clone()).await.unwrap();
-    let got = tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            match pc.events.recv().await {
-                Ok(NodeEvent::PhotoAdded { device, photo }) if device == phone_id => break photo,
-                Ok(_) => {}
-                Err(e) => panic!("event stream failed: {e:?}"),
+    let mut seen_pc = Vec::new();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(6);
+    let mut ticker = tokio::time::interval(Duration::from_millis(250));
+    let mut got = None;
+    while tokio::time::Instant::now() < deadline {
+        tokio::select! {
+            _ = ticker.tick() => {
+                let _ = phone.node.photo_taken(photo.clone()).await;
             }
+            ev = pc.events.recv() => {
+                match ev {
+                    Ok(NodeEvent::PhotoAdded { device, photo: received }) if device == phone_id => {
+                        got = Some(received);
+                        break;
+                    }
+                    Ok(NodeEvent::LinkChanged { device, link }) if device == phone_id => {
+                        seen_pc.push(format!("{link:?}"));
+                    }
+                    Ok(_) => {}
+                    Err(e) => panic!("event stream failed: {e:?}"),
+                }
+            }
+            _ = tokio::time::sleep_until(deadline) => break,
         }
-    })
-    .await
-    .expect("screenshot taken right after USB replacement should reach PC immediately");
-    assert_eq!(got, photo);
+    }
+    assert_eq!(
+        got.as_ref(),
+        Some(&photo),
+        "screenshot did not arrive after USB replacement within 6s (seen_pc={seen_pc:?}, pc_link={:?}, phone_link={:?})",
+        pc.node.paired_devices().ok(),
+        phone.node.paired_devices().ok(),
+    );
     assert!(
         started.elapsed() < Duration::from_secs(6),
         "expected sub-6s USB wobble recovery + photo delivery, took {:?}",

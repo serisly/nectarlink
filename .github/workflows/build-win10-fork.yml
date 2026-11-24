@@ -35,10 +35,10 @@ jobs:
           $code = $LASTEXITCODE
           $out | ForEach-Object { Write-Host $_ }
           if ($code -ne 0) {
-            ($out | Select-String -Pattern 'error(\[E\d+\])?:|FAILED|panicked at' -Context 0,3 | ForEach-Object {
+            ($out | Select-String -Pattern '(^|\s)(error(\[E\d+\])?:|panicked at|test .* FAILED)' -Context 0,3 | Where-Object { $_.Line -notmatch '\.\.\. ok$' } | ForEach-Object {
               $_.Line
               $_.Context.PostContext
-            }) | Select-Object -First 35 | ForEach-Object {
+            }) | Where-Object { $_ -and $_.Trim() -ne '' } | Select-Object -First 10 | ForEach-Object {
               Write-Host "::error::$_"
             }
             exit $code
