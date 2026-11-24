@@ -226,6 +226,8 @@ FunctionEnd
   ; Moved aside earlier and no longer loaded.
   Delete "$INSTDIR\*.dll.*.old"
   !insertmacro MoveAsideInUse "nectarlink_vcam.dll"
+  !insertmacro MoveAsideInUse "UnityCaptureFilter64.dll"
+  !insertmacro MoveAsideInUse "UnityCaptureFilter32.dll"
   ; LogonUI keeps the unlock credential provider loaded once it has used it.
   !insertmacro MoveAsideInUse "nectarlink_credprov.dll"
   !insertmacro MoveAsideInUse "vcruntime140.dll"
@@ -546,6 +548,8 @@ Section "Uninstall"
     Delete "$INSTDIR\${EXE}"
     Delete "$INSTDIR\nectarlink-agent.exe"
     !insertmacro MoveAsideInUse "nectarlink_vcam.dll"
+    !insertmacro MoveAsideInUse "UnityCaptureFilter64.dll"
+    !insertmacro MoveAsideInUse "UnityCaptureFilter32.dll"
     !insertmacro MoveAsideInUse "nectarlink_credprov.dll"
     Delete "$INSTDIR\AppxManifest.xml"
     RMDir /r "$INSTDIR\Assets"

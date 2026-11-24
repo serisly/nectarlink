@@ -382,6 +382,7 @@ pub fn setup_addon() {
                 s.vcam_handle = handle;
             }
         });
+        core_host::refresh_capabilities();
         core_host::host().hub.changed(Changes::WEBCAM);
     });
 }
@@ -406,6 +407,7 @@ pub fn remove_addon() {
             s.addon_busy = false;
             s.addon_registered = registered;
         });
+        core_host::refresh_capabilities();
         core_host::host().hub.changed(Changes::WEBCAM);
     });
 }
@@ -473,7 +475,7 @@ fn refresh_idle_frame() {
     if let Some(mapping) = idle_mapping() {
         mapping.set_idle(&name);
     }
-    #[cfg(target_os = "macos")]
+    #[cfg(any(windows, target_os = "macos"))]
     state(|s| {
         if let Some(ref handle) = s.vcam_handle {
             handle.set_idle(&name);
@@ -899,7 +901,7 @@ fn decode(device: DeviceId, items: &Receiver<Item>, waiting: &AtomicUsize) {
                         // Already flipped in place if `flip` is true, so pass `false` here.
                         map.write_frame(&phone_name, src_w, src_h, time_us, &bgrx, false);
                     }
-                    #[cfg(target_os = "macos")]
+                    #[cfg(any(windows, target_os = "macos"))]
                     if !published {
                         state(|s| {
                             if let Some(ref handle) = s.vcam_handle {

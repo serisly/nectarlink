@@ -1,0 +1,89 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+name: Build Windows 10 Fork Installer
+
+on:
+  push:
+    branches:
+      - win10-webcam
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  QT_VERSION: "6.12.0"
+
+jobs:
+  windows-x64:
+    name: Windows x64 Installer (Win10 DirectShow + Win11 MF)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install pinned Rust toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: fork-win10-x64
+
+      - name: Run core and vcam unit tests
+        shell: pwsh
+        run: cargo test --locked -p nectarlink-core -p nectarlink-vcam
+
+      - name: Install Qt
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: ${{ env.QT_VERSION }}
+          host: windows
+          target: desktop
+          arch: win64_msvc2022_64
+          cache: true
+          aqtsource: git+https://github.com/miurahr/aqtinstall.git@5a49f2b391ae8ee1d3c0dd87f8b33c1d49a4deb7
+
+      - name: Run desktop vcam unit tests
+        shell: pwsh
+        run: cargo test --locked -p nectarlink-desktop win::vcam
+
+      - name: Install NSIS
+        shell: pwsh
+        run: ./scripts/install-nsis.ps1
+
+      - name: Build Windows x64 installer
+        shell: pwsh
+        run: ./scripts/package.ps1
+
+      - name: Smoke-test installer
+        shell: pwsh
+        run: ./scripts/smoke-installer.ps1
+
+      - name: Generate SHA-256 sums
+        shell: pwsh
+        run: |
+          $files = Get-ChildItem target/package/*-setup.exe
+          $lines = foreach ($f in $files) {
+            $h = (Get-FileHash $f.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+            "$h  $($f.Name)"
+          }
+          $lines | Set-Content -Encoding ascii target/package/SHA256SUMS.txt
+          Get-Content target/package/SHA256SUMS.txt
+
+      - name: Upload installer artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: nectarlink-win10-x64-setup
+          path: |
+            target/package/*-setup.exe
+            target/package/SHA256SUMS.txt
+
+      - name: Publish fork release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: win10-vcam-latest
+          name: "NectarLink Win10 Webcam Fork (${{ github.sha }})"
+          prerelease: true
+          make_latest: false
+          files: |
+            target/package/*-setup.exe
+            target/package/SHA256SUMS.txt

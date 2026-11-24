@@ -78,9 +78,13 @@ pub fn is_registered_under(root: HKEY, classes_prefix: &str) -> bool {
     path.is_file()
 }
 
-/// Returns `true` if `nectarlink_vcam.dll` is registered in `HKLM` and exists on disk.
+/// Returns `true` if the active Windows virtual camera backend is registered in `HKLM`.
 pub fn is_registered() -> bool {
-    is_registered_under(HKEY_LOCAL_MACHINE, HKLM_CLSID_PREFIX)
+    if create_virtual_camera().is_some() {
+        is_registered_under(HKEY_LOCAL_MACHINE, HKLM_CLSID_PREFIX)
+    } else {
+        super::vcam_dshow::is_registered()
+    }
 }
 
 fn set_reg_sz(key: HKEY, name: Option<&str>, value: &str) -> Result<(), String> {
@@ -162,15 +166,24 @@ pub fn unregister_under(root: HKEY, classes_prefix: &str, frameserver_prefix: &s
     Ok(())
 }
 
-/// Registers `nectarlink_vcam.dll` in `HKLM` (requires administrator privileges).
+/// Registers the Windows virtual camera backend in `HKLM` (requires administrator privileges).
+/// Uses Media Foundation (`nectarlink_vcam.dll`) on Windows 11 and DirectShow on Windows 10.
 pub fn register_hklm() -> Result<(), String> {
-    let dll = dll_path().ok_or_else(|| "cannot resolve nectarlink_vcam.dll path".to_owned())?;
-    register_under(HKEY_LOCAL_MACHINE, HKLM_CLSID_PREFIX, HKLM_FRAMESERVER_PREFIX, &dll)
+    if create_virtual_camera().is_some() {
+        let dll = dll_path().ok_or_else(|| "cannot resolve nectarlink_vcam.dll path".to_owned())?;
+        register_under(HKEY_LOCAL_MACHINE, HKLM_CLSID_PREFIX, HKLM_FRAMESERVER_PREFIX, &dll)
+    } else {
+        super::vcam_dshow::register_hklm()
+    }
 }
 
-/// Unregisters `nectarlink_vcam.dll` from `HKLM` (requires administrator privileges).
+/// Unregisters the Windows virtual camera backend from `HKLM` (requires administrator privileges).
 pub fn unregister_hklm() -> Result<(), String> {
-    unregister_under(HKEY_LOCAL_MACHINE, HKLM_CLSID_PREFIX, HKLM_FRAMESERVER_PREFIX)
+    if create_virtual_camera().is_some() {
+        unregister_under(HKEY_LOCAL_MACHINE, HKLM_CLSID_PREFIX, HKLM_FRAMESERVER_PREFIX)
+    } else {
+        super::vcam_dshow::unregister_hklm()
+    }
 }
 
 /// Launches `nectarlink-desktop.exe <arg>` elevated via `ShellExecuteExW` (`"runas"`)
@@ -232,12 +245,17 @@ fn create_virtual_camera() -> Option<CreateVirtualCamera> {
     })
 }
 
-/// Active `IMFVirtualCamera` session handle.
-pub struct VirtualCameraHandle {
-    vcam: Option<IMFVirtualCamera>,
+enum Backend {
+    MediaFoundation(IMFVirtualCamera),
+    DirectShow(super::vcam_dshow::DShowWriter),
 }
 
-// SAFETY: `IMFVirtualCamera` is a thread-safe COM interface.
+/// Active virtual camera session handle (Windows 11 Media Foundation or Windows 10 DirectShow).
+pub struct VirtualCameraHandle {
+    backend: Option<Backend>,
+}
+
+// SAFETY: `IMFVirtualCamera` is a thread-safe COM interface and `DShowWriter` is internally synchronized.
 unsafe impl Send for VirtualCameraHandle {}
 unsafe impl Sync for VirtualCameraHandle {}
 
@@ -248,11 +266,12 @@ impl std::fmt::Debug for VirtualCameraHandle {
 }
 
 impl VirtualCameraHandle {
-    /// Creates and starts the `"NectarLink Webcam"` session-lifetime virtual camera.
-    /// Succeeds when `nectarlink_vcam.dll` is registered in `HKLM`.
+    /// Starts the `"NectarLink Webcam"` virtual camera session on Windows 11 (Media Foundation)
+    /// or Windows 10 (DirectShow).
     pub fn start() -> Result<Self, String> {
-        let create =
-            create_virtual_camera().ok_or_else(|| "the virtual camera needs Windows 11".to_owned())?;
+        let Some(create) = create_virtual_camera() else {
+            return Ok(Self { backend: Some(Backend::DirectShow(super::vcam_dshow::DShowWriter::new())) });
+        };
         unsafe {
             MFStartup(MF_VERSION, MFSTARTUP_NOSOCKET).map_err(|e| e.to_string())?;
             let categories = [KSCATEGORY_VIDEO_CAMERA, KSCATEGORY_VIDEO, KSCATEGORY_CAPTURE];
@@ -276,24 +295,49 @@ impl VirtualCameraHandle {
             }
             // SAFETY: on success the out parameter holds an owned IMFVirtualCamera reference.
             let vcam = IMFVirtualCamera::from_raw(raw);
-            let handle = Self { vcam: Some(vcam) };
-            if let Some(vcam) = &handle.vcam {
-                vcam.Start(None).map_err(|e| e.to_string())?;
+            if let Err(e) = vcam.Start(None) {
+                let _ = vcam.Remove();
+                drop(vcam);
+                let _ = MFShutdown();
+                return Err(e.to_string());
             }
-            Ok(handle)
+            Ok(Self { backend: Some(Backend::MediaFoundation(vcam)) })
+        }
+    }
+
+    /// Publishes a decoded top-down BGRX frame directly when running the Windows 10 DirectShow backend.
+    /// On Windows 11, Media Foundation Frame Server reads `Global\NectarlinkVcamFrame_v2` directly.
+    pub fn write_frame(
+        &self,
+        _phone_name: &str,
+        width: u32,
+        height: u32,
+        _time_us: u64,
+        bgrx: &[u8],
+        _mirror: bool,
+    ) {
+        if let Some(Backend::DirectShow(writer)) = &self.backend {
+            writer.write_bgrx(width, height, bgrx);
+        }
+    }
+
+    /// Publishes the idle placeholder frame when running the Windows 10 DirectShow backend.
+    pub fn set_idle(&self, phone_name: &str) {
+        if let Some(Backend::DirectShow(writer)) = &self.backend {
+            writer.set_idle(phone_name);
         }
     }
 }
 
 impl Drop for VirtualCameraHandle {
     fn drop(&mut self) {
-        unsafe {
-            if let Some(vcam) = self.vcam.take() {
+        if let Some(Backend::MediaFoundation(vcam)) = self.backend.take() {
+            unsafe {
                 let _ = vcam.Stop();
                 let _ = vcam.Remove();
                 drop(vcam);
+                let _ = MFShutdown();
             }
-            let _ = MFShutdown();
         }
     }
 }

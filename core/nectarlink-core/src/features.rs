@@ -1079,7 +1079,7 @@ pub const FEATURES: &[FeatureDef] = &[
             phone("camera.stream", Unlock::Permission(Permission::Camera)),
             desktop("camera.virtual", UPDATE),
             desktop("addon.vcam", Unlock::Addon("vcam")),
-            WindowsBuildAtLeast(22000),
+            WindowsBuildAtLeast(19041),
             DeviceToggle("webcam"),
         ],
         partial: None,
@@ -1380,31 +1380,37 @@ mod tests {
     fn old_systems_are_unsupported() {
         let phone =
             facts(DeviceKind::Phone, "android", "10", PowerLevel::Elevated, &["mirror.virtual_display"]);
-        let win10 = facts(
+        let old_win10 = facts(
+            DeviceKind::Desktop,
+            "windows",
+            "10.0.18363",
+            PowerLevel::NotApplicable,
+            &["camera.virtual", "addon.vcam"],
+        );
+        let win10_22h2 = facts(
             DeviceKind::Desktop,
             "windows",
             "10.0.19045",
             PowerLevel::NotApplicable,
             &["camera.virtual", "addon.vcam"],
         );
-        let m = matrix_with(&phone, &win10, &HashMap::new());
+        let m = matrix_with(&phone, &old_win10, &HashMap::new());
         assert_eq!(
             m.state("mirroring.app_windows"),
             Some(FeatureState::Unsupported { reason: UnsupportedReason::AndroidTooOld { needs: 11 } })
         );
         let mut caps = BASIC_PHONE.to_vec();
         caps.push("camera.stream");
-        let m = matrix_with(
-            &facts(DeviceKind::Phone, "android", "16", PowerLevel::Basic, &caps),
-            &win10,
-            &HashMap::new(),
-        );
+        let phone_cam = facts(DeviceKind::Phone, "android", "16", PowerLevel::Basic, &caps);
+        let m = matrix_with(&phone_cam, &old_win10, &HashMap::new());
         assert_eq!(
             m.state("camera.webcam"),
             Some(FeatureState::Unsupported {
-                reason: UnsupportedReason::WindowsTooOld { needs_build: 22000 }
+                reason: UnsupportedReason::WindowsTooOld { needs_build: 19041 }
             })
         );
+        let m_win10 = matrix_with(&phone_cam, &win10_22h2, &HashMap::new());
+        assert_eq!(m_win10.state("camera.webcam"), Some(FeatureState::Available));
     }
 
     #[test]

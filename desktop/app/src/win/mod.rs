@@ -39,6 +39,7 @@ pub mod tray;
 pub mod unlock;
 pub mod usb_driver;
 pub mod vcam;
+pub mod vcam_dshow;
 pub mod wallpaper;
 pub mod widget;
 pub mod wifi;

@@ -145,6 +145,13 @@ if (-not (Test-Path $agentExe)) { throw "no release build at $agentExe" }
 Copy-Item $agentExe $stage
 Copy-Item $vcamDll $stage
 Copy-Item $credprovDll $stage
+if (-not $isArm64) {
+    foreach ($dshowDll in @('UnityCaptureFilter64.dll', 'UnityCaptureFilter32.dll')) {
+        $src = Join-Path $root "desktop\vcam\dshow\$dshowDll"
+        if (-not (Test-Path $src)) { throw "missing Windows 10 DirectShow filter at $src" }
+        Copy-Item $src $stage
+    }
+}
 
 Invoke-Native "windeployqt" {
     $deployArgs = @(
