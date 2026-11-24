@@ -30,7 +30,7 @@ use windows::{
             },
         },
     },
-    core::{HSTRING, PCWSTR, w},
+    core::{HSTRING, PCWSTR},
 };
 
 /// DirectShow filter CLSID exported by `UnityCaptureFilter{32,64}.dll`.
@@ -41,16 +41,20 @@ const DSHOW_CATEGORY_PREFIX: &str =
 
 const DLL_64: &str = "UnityCaptureFilter64.dll";
 const DLL_32: &str = "UnityCaptureFilter32.dll";
+const DEFAULT_SHM_PREFIX: &str = "UnityCapture_";
 
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 const SYNCHRONIZE_RIGHT: SYNCHRONIZATION_ACCESS_RIGHTS = SYNCHRONIZATION_ACCESS_RIGHTS(0x0010_0000);
 const MUTEX_WAIT_MS: u32 = 50;
-const REOPEN_BACKOFF: Duration = Duration::from_millis(150);
+const REOPEN_BACKOFF: Duration = Duration::from_millis(20);
 
 const FORMAT_UINT8: i32 = 0;
 const RESIZEMODE_LINEAR: i32 = 1;
 const MIRRORMODE_DISABLED: i32 = 0;
-const FRAME_TIMEOUT_MS: i32 = 1000;
+const STREAM_TIMEOUT_MS: i32 = 5_000;
+/// Keeps NectarLink's dark idle card displayed while idle instead of tripping
+/// UnityCapture's green "sending stopped" fallback after a short timeout.
+const IDLE_TIMEOUT_MS: i32 = 86_400_000;
 
 /// Exact C layout of `SharedImageMemory::SharedMemHeader` from UnityCapture `shared.inl`.
 #[repr(C)]
@@ -128,10 +132,10 @@ fn run_regsvr32(dll: &Path, register: bool, use_wow64: bool) -> Result<(), Strin
     if !register {
         cmd.arg("/u");
     }
-    cmd.arg(dll);
     if register {
         cmd.arg(format!("/i:UnityCaptureName={}", super::vcam::FRIENDLY_NAME));
     }
+    cmd.arg(dll);
     let status = cmd
         .status()
         .map_err(|e| format!("failed to launch regsvr32 for {}: {e}", dll.display()))?;
@@ -205,24 +209,38 @@ impl Drop for MutexLock {
 }
 
 struct DShowInner {
+    mutex_name: HSTRING,
+    want_name: HSTRING,
+    sent_name: HSTRING,
+    data_name: HSTRING,
     mutex: Option<HANDLE>,
     want_event: Option<HANDLE>,
     sent_event: Option<HANDLE>,
     mapping: Option<HANDLE>,
     view: Option<MEMORY_MAPPED_VIEW_ADDRESS>,
     last_probe: Option<Instant>,
+    fit_scratch: Vec<u8>,
     rgba_scratch: Vec<u8>,
 }
 
 impl DShowInner {
     fn new() -> Self {
+        Self::with_prefix(DEFAULT_SHM_PREFIX)
+    }
+
+    fn with_prefix(prefix: &str) -> Self {
         Self {
+            mutex_name: HSTRING::from(format!("{prefix}Mutx")),
+            want_name: HSTRING::from(format!("{prefix}Want")),
+            sent_name: HSTRING::from(format!("{prefix}Sent")),
+            data_name: HSTRING::from(format!("{prefix}Data")),
             mutex: None,
             want_event: None,
             sent_event: None,
             mapping: None,
             view: None,
             last_probe: None,
+            fit_scratch: Vec::new(),
             rgba_scratch: Vec::new(),
         }
     }
@@ -250,6 +268,10 @@ impl DShowInner {
     }
 
     /// Connects lazily to the DirectShow filter's shared memory once a consumer app opens the camera.
+    ///
+    /// Follows UnityCapture `SharedImageMemory::Open(ForReceiving = false)`: keeps `mutex` and
+    /// `want_event` open across retries so the DirectShow filter can acquire the mutex, observe
+    /// `UnityCapture_Want`, and create `UnityCapture_Sent` and `UnityCapture_Data`.
     fn try_open(&mut self) -> bool {
         if self.view.is_some() {
             return true;
@@ -261,59 +283,51 @@ impl DShowInner {
         }
         self.last_probe = Some(Instant::now());
 
-        let Ok(mutex) = (unsafe { OpenMutexW(SYNCHRONIZE_RIGHT, false, w!("UnityCapture_Mutx")) })
-        else {
+        if self.mutex.is_none() {
+            let Ok(mutex) = (unsafe { OpenMutexW(SYNCHRONIZE_RIGHT, false, &self.mutex_name) })
+            else {
+                return false;
+            };
+            self.mutex = Some(mutex);
+        }
+        let Some(mutex) = self.mutex else {
+            return false;
+        };
+        let Some(_guard) = MutexLock::acquire(mutex, MUTEX_WAIT_MS) else {
             return false;
         };
 
-        let opened = (|| -> Option<(HANDLE, HANDLE, HANDLE, MEMORY_MAPPED_VIEW_ADDRESS)> {
-            let _guard = MutexLock::acquire(mutex, MUTEX_WAIT_MS)?;
-            let want = unsafe { CreateEventW(None, false, false, w!("UnityCapture_Want")) }.ok()?;
-            let Ok(sent) = (unsafe { OpenEventW(EVENT_MODIFY_STATE, false, w!("UnityCapture_Sent")) })
-            else {
-                unsafe {
-                    let _ = CloseHandle(want);
-                }
-                return None;
+        if self.want_event.is_none() {
+            let Ok(want) = (unsafe { CreateEventW(None, false, false, &self.want_name) }) else {
+                return false;
             };
-            let Ok(mapping) =
-                (unsafe { OpenFileMappingW(FILE_MAP_WRITE.0, false, w!("UnityCapture_Data")) })
-            else {
-                unsafe {
-                    let _ = CloseHandle(sent);
-                    let _ = CloseHandle(want);
-                }
-                return None;
-            };
-            let view = unsafe { MapViewOfFile(mapping, FILE_MAP_WRITE, 0, 0, 0) };
-            if view.Value.is_null() {
-                unsafe {
-                    let _ = CloseHandle(mapping);
-                    let _ = CloseHandle(sent);
-                    let _ = CloseHandle(want);
-                }
-                return None;
-            }
-            Some((want, sent, mapping, view))
-        })();
-
-        match opened {
-            Some((want, sent, mapping, view)) => {
-                self.mutex = Some(mutex);
-                self.want_event = Some(want);
-                self.sent_event = Some(sent);
-                self.mapping = Some(mapping);
-                self.view = Some(view);
-                tracing::info!("connected to Windows 10 DirectShow virtual camera shared memory");
-                true
-            }
-            None => {
-                unsafe {
-                    let _ = CloseHandle(mutex);
-                }
-                false
-            }
+            self.want_event = Some(want);
         }
+        if self.sent_event.is_none() {
+            let Ok(sent) = (unsafe { OpenEventW(EVENT_MODIFY_STATE, false, &self.sent_name) })
+            else {
+                return false;
+            };
+            self.sent_event = Some(sent);
+        }
+        if self.mapping.is_none() {
+            let Ok(mapping) =
+                (unsafe { OpenFileMappingW(FILE_MAP_WRITE.0, false, &self.data_name) })
+            else {
+                return false;
+            };
+            self.mapping = Some(mapping);
+        }
+        let Some(mapping) = self.mapping else {
+            return false;
+        };
+        let view = unsafe { MapViewOfFile(mapping, FILE_MAP_WRITE, 0, 0, 0) };
+        if view.Value.is_null() {
+            return false;
+        }
+        self.view = Some(view);
+        tracing::info!("connected to Windows 10 DirectShow virtual camera shared memory");
+        true
     }
 }
 
@@ -321,6 +335,15 @@ impl Drop for DShowInner {
     fn drop(&mut self) {
         self.close_handles();
     }
+}
+
+/// Returns a 16:9 landscape canvas for upright portrait phone frames so UnityCapture's linear
+/// resize doesn't stretch portrait video horizontally across 16:9 DirectShow outputs.
+fn portrait_landscape_canvas(width: u32, height: u32) -> Option<(u32, u32)> {
+    if width == 0 || height == 0 || width >= height {
+        return None;
+    }
+    Some(if width <= 720 { (1280, 720) } else { (1920, 1080) })
 }
 
 /// Converts top-down `BGRX` pixels into bottom-up `RGBA` pixels expected by UnityCaptureFilter.
@@ -362,17 +385,26 @@ impl DShowWriter {
         Self { inner: Mutex::new(DShowInner::new()) }
     }
 
+    #[cfg(test)]
+    fn with_prefix(prefix: &str) -> Self {
+        Self { inner: Mutex::new(DShowInner::with_prefix(prefix)) }
+    }
+
     pub fn write_bgrx(&self, width: u32, height: u32, bgrx: &[u8]) {
+        self.write_bgrx_with_timeout(width, height, bgrx, STREAM_TIMEOUT_MS);
+    }
+
+    fn write_bgrx_with_timeout(&self, width: u32, height: u32, bgrx: &[u8], timeout_ms: i32) {
         if width == 0 || height == 0 {
             return;
         }
-        let Some(data_size) = (width as usize)
+        let Some(src_size) = (width as usize)
             .checked_mul(height as usize)
             .and_then(|px| px.checked_mul(4))
         else {
             return;
         };
-        if bgrx.len() < data_size {
+        if bgrx.len() < src_size {
             return;
         }
 
@@ -388,18 +420,34 @@ impl DShowWriter {
             return;
         };
 
-        bgrx_to_bottom_up_rgba(width as usize, height as usize, bgrx, &mut inner.rgba_scratch);
+        let (out_w, out_h) = if let Some((dst_w, dst_h)) = portrait_landscape_canvas(width, height) {
+            let dst_len = (dst_w as usize) * (dst_h as usize) * 4;
+            inner.fit_scratch.resize(dst_len, 0);
+            nectarlink_vcam::fit_bgrx_aspect(bgrx, width, height, &mut inner.fit_scratch, dst_w, dst_h);
+            let inner_ref = &mut *inner;
+            bgrx_to_bottom_up_rgba(
+                dst_w as usize,
+                dst_h as usize,
+                &inner_ref.fit_scratch,
+                &mut inner_ref.rgba_scratch,
+            );
+            (dst_w, dst_h)
+        } else {
+            bgrx_to_bottom_up_rgba(width as usize, height as usize, bgrx, &mut inner.rgba_scratch);
+            (width, height)
+        };
+        let data_size = inner.rgba_scratch.len();
 
         if let Some(_guard) = MutexLock::acquire(mutex, MUTEX_WAIT_MS) {
             let hdr = unsafe { &mut *(view.Value as *mut SharedMemHeader) };
             if (hdr.max_size as usize) >= data_size {
-                hdr.width = width as i32;
-                hdr.height = height as i32;
-                hdr.stride = width as i32;
+                hdr.width = out_w as i32;
+                hdr.height = out_h as i32;
+                hdr.stride = out_w as i32;
                 hdr.format = FORMAT_UINT8;
                 hdr.resize_mode = RESIZEMODE_LINEAR;
                 hdr.mirror_mode = MIRRORMODE_DISABLED;
-                hdr.timeout = FRAME_TIMEOUT_MS;
+                hdr.timeout = timeout_ms;
                 unsafe {
                     let dst = (view.Value as *mut u8).add(HEADER_SIZE);
                     std::ptr::copy_nonoverlapping(inner.rgba_scratch.as_ptr(), dst, data_size);
@@ -415,13 +463,20 @@ impl DShowWriter {
         let (w, h) = (1280u32, 720u32);
         let mut bgrx = vec![0u8; (w * h * 4) as usize];
         nectarlink_vcam::render_placeholder_bgrx(&mut bgrx, w, h, phone_name);
-        self.write_bgrx(w, h, &bgrx);
+        self.write_bgrx_with_timeout(w, h, &bgrx, IDLE_TIMEOUT_MS);
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use windows::Win32::{
+        Foundation::INVALID_HANDLE_VALUE,
+        System::{
+            Memory::{CreateFileMappingW, PAGE_READWRITE},
+            Threading::CreateMutexW,
+        },
+    };
 
     #[test]
     fn shared_header_is_32_bytes() {
@@ -448,5 +503,92 @@ mod tests {
                 30, 20, 10, 255, 60, 50, 40, 255,
             ]
         );
+    }
+
+    #[test]
+    fn portrait_canvas_preserves_aspect_without_touching_landscape() {
+        assert_eq!(portrait_landscape_canvas(1280, 720), None);
+        assert_eq!(portrait_landscape_canvas(1920, 1080), None);
+        assert_eq!(portrait_landscape_canvas(720, 1280), Some((1280, 720)));
+        assert_eq!(portrait_landscape_canvas(1080, 1920), Some((1920, 1080)));
+    }
+
+    #[test]
+    fn two_step_unity_capture_handshake_delivers_frame() {
+        let prefix = format!("NectarlinkDShowTest_{}_", std::process::id());
+        let mut_name = HSTRING::from(format!("{prefix}Mutx"));
+        let want_name = HSTRING::from(format!("{prefix}Want"));
+        let sent_name = HSTRING::from(format!("{prefix}Sent"));
+        let data_name = HSTRING::from(format!("{prefix}Data"));
+
+        // Step 1: simulated UnityCaptureFilter receiver creates only Mutx first.
+        let recv_mut = unsafe { CreateMutexW(None, false, &mut_name) }.unwrap();
+        let writer = DShowWriter::with_prefix(&prefix);
+
+        let bgrx = vec![
+            10, 20, 30, 0, 40, 50, 60, 0,
+            70, 80, 90, 0, 1, 2, 3, 0,
+        ];
+
+        // Sender call #1 must open Mutx, create Want, and keep both alive while Sent is absent.
+        writer.write_bgrx(2, 2, &bgrx);
+
+        // Step 2: receiver must now observe Want, then create Sent and Data mapping.
+        let recv_want = unsafe { OpenEventW(EVENT_MODIFY_STATE, false, &want_name) }
+            .expect("sender must keep Want event open across retries");
+        let recv_sent = unsafe { CreateEventW(None, false, false, &sent_name) }.unwrap();
+        let max_payload = 4096u32;
+        let recv_map = unsafe {
+            CreateFileMappingW(
+                INVALID_HANDLE_VALUE,
+                None,
+                PAGE_READWRITE,
+                0,
+                HEADER_SIZE as u32 + max_payload,
+                &data_name,
+            )
+        }
+        .unwrap();
+        let recv_view = unsafe { MapViewOfFile(recv_map, FILE_MAP_WRITE, 0, 0, 0) };
+        assert!(!recv_view.Value.is_null());
+        unsafe {
+            (*(recv_view.Value as *mut SharedMemHeader)).max_size = max_payload;
+        }
+
+        // Step 3: after reopen backoff, sender call #2 completes handshake and writes pixels.
+        std::thread::sleep(REOPEN_BACKOFF + Duration::from_millis(10));
+        writer.write_bgrx(2, 2, &bgrx);
+
+        assert_eq!(unsafe { WaitForSingleObject(recv_sent, 0) }, WAIT_OBJECT_0);
+        let (w, h, stride, timeout, pixels) = unsafe {
+            let hdr = &*(recv_view.Value as *const SharedMemHeader);
+            let px = std::slice::from_raw_parts((recv_view.Value as *const u8).add(HEADER_SIZE), 16)
+                .to_vec();
+            (hdr.width, hdr.height, hdr.stride, hdr.timeout, px)
+        };
+        assert_eq!((w, h, stride, timeout), (2, 2, 2, STREAM_TIMEOUT_MS));
+        assert_eq!(
+            pixels,
+            vec![
+                90, 80, 70, 255, 3, 2, 1, 255,
+                30, 20, 10, 255, 60, 50, 40, 255,
+            ]
+        );
+
+        // Step 4: dropping writer clears dimensions cleanly.
+        drop(writer);
+        let (w_after, h_after) = unsafe {
+            let hdr = &*(recv_view.Value as *const SharedMemHeader);
+            (hdr.width, hdr.height)
+        };
+        assert_eq!((w_after, h_after), (0, 0));
+
+        unsafe {
+            let _ = UnmapViewOfFile(recv_view);
+            let _ = CloseHandle(recv_map);
+            let _ = CloseHandle(recv_sent);
+            let _ = CloseHandle(recv_want);
+            let _ = CloseHandle(recv_mut);
+        }
     }
 }
