@@ -982,7 +982,7 @@ impl Shared {
             self.start_supervisor(peer);
             if let Some(session) = self.session(&peer) {
                 if let Some(old_port) = replaced_port
-                    && session.has_loopback_path_port(old_port)
+                    && session.is_bound_to_usb_bridge_port(old_port)
                 {
                     tracing::info!(
                         peer = %peer.short(),
@@ -1112,7 +1112,7 @@ impl Shared {
             // Even when a newer USB tunnel has already replaced `bridge_addr` in
             // `usb_peers`, close any session still stranded on the dead port.
             if let Some(session) = self.session(&peer)
-                && session.has_loopback_path_port(bridge_port)
+                && session.is_bound_to_usb_bridge_port(bridge_port)
             {
                 tracing::info!(
                     peer = %peer.short(),
@@ -1134,7 +1134,7 @@ impl Shared {
             self.remember_addrs(&peer, &record.last_addrs);
         }
         if let Some(session) = self.session(&peer) {
-            if session.has_loopback_path_port(bridge_port) {
+            if session.is_bound_to_usb_bridge_port(bridge_port) {
                 tracing::info!(
                     peer = %peer.short(),
                     port = bridge_port,

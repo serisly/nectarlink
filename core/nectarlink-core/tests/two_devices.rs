@@ -9013,21 +9013,28 @@ async fn usb_tunnel_disconnect_closes_stranded_session_immediately() {
     // session immediately rather than waiting 11.5-18.5s for heartbeat timeout.
     let started = std::time::Instant::now();
     let _ = close_tx.send(());
-    tokio::time::timeout(Duration::from_secs(4), async {
+    let mut seen = Vec::new();
+    let closed = tokio::time::timeout(Duration::from_secs(4), async {
         loop {
             match pc.events.recv().await {
-                Ok(NodeEvent::LinkChanged { device, link: LinkState::Offline { .. } })
-                    if device == phone_id =>
-                {
-                    break;
+                Ok(NodeEvent::LinkChanged { device, link }) if device == phone_id => {
+                    let offline = matches!(link, LinkState::Offline { .. });
+                    seen.push(format!("{link:?}"));
+                    if offline {
+                        break;
+                    }
                 }
                 Ok(_) => {}
                 Err(e) => panic!("event stream failed: {e:?}"),
             }
         }
     })
-    .await
-    .expect("USB session should close immediately on tunnel disconnect without waiting for heartbeat");
+    .await;
+    assert!(
+        closed.is_ok(),
+        "USB session did not close on tunnel disconnect (seen={seen:?}, link={:?})",
+        pc.node.paired_devices().ok()
+    );
     assert!(
         started.elapsed() < Duration::from_secs(4),
         "expected fast USB disconnect teardown, took {:?}",
@@ -9073,28 +9080,30 @@ async fn usb_tunnel_replacement_switches_session_without_waiting_for_heartbeat()
 
     // Wait for the replacement session to come online on both sides (well under
     // the 11.5-18.5s heartbeat).
-    tokio::time::timeout(Duration::from_secs(5), async {
+    let mut seen_pc = Vec::new();
+    let reconnected = tokio::time::timeout(Duration::from_secs(5), async {
         let mut saw_offline = false;
         loop {
             match pc.events.recv().await {
-                Ok(NodeEvent::LinkChanged { device, link: LinkState::Offline { .. } })
-                    if device == phone_id =>
-                {
-                    saw_offline = true;
-                }
-                Ok(NodeEvent::LinkChanged {
-                    device,
-                    link: LinkState::Online { path: ConnectionPath::Usb, .. },
-                }) if device == phone_id && saw_offline => {
-                    break;
+                Ok(NodeEvent::LinkChanged { device, link }) if device == phone_id => {
+                    seen_pc.push(format!("{link:?}"));
+                    match link {
+                        LinkState::Offline { .. } => saw_offline = true,
+                        LinkState::Online { path: ConnectionPath::Usb, .. } if saw_offline => break,
+                        _ => {}
+                    }
                 }
                 Ok(_) => {}
                 Err(e) => panic!("event stream failed: {e:?}"),
             }
         }
     })
-    .await
-    .expect("USB replacement tunnel should tear down the dead session and reconnect quickly");
+    .await;
+    assert!(
+        reconnected.is_ok(),
+        "USB replacement tunnel did not reconnect quickly (seen_pc={seen_pc:?}, link={:?})",
+        pc.node.paired_devices().ok()
+    );
 
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {

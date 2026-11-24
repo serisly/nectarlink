@@ -242,6 +242,8 @@ pub(crate) struct Session {
     last_rx_ms: AtomicU64,
     usb_bridge_ports: Arc<Mutex<HashMap<u16, DeviceId>>>,
     usb_peers: Arc<Mutex<HashMap<DeviceId, (std::net::SocketAddr, CancellationToken)>>>,
+    /// Local loopback USB bridge port this session was spawned on, if any.
+    usb_bridge_port: Option<u16>,
     /// Apps whose notification icon this peer already got.
     sent_icons: crate::notifications::SentIcons,
     /// Serializes media snapshots and remembers the artwork queued for this device.
@@ -307,6 +309,24 @@ impl Session {
             .iter()
             .find(|p| p.is_selected())
             .map_or(0, |p| p.rtt().as_millis().min(u128::from(u32::MAX)) as u32);
+        let usb_bridge_port = conn
+            .paths()
+            .iter()
+            .find_map(|p| match p.remote_addr() {
+                iroh::TransportAddr::Ip(addr) if shared.is_usb_addr_for(&peer, addr) => Some(addr.port()),
+                _ => None,
+            })
+            .or_else(|| {
+                let has_non_loopback_ip = conn.paths().iter().any(|p| {
+                    matches!(
+                        p.remote_addr(),
+                        iroh::TransportAddr::Ip(addr) if !addr.ip().to_canonical().is_loopback()
+                    )
+                });
+                (!has_non_loopback_ip)
+                    .then(|| shared.usb_peer_addr(&peer).map(|addr| addr.port()))
+                    .flatten()
+            });
         // (`transport_rtt_ms` reads the same, once the session exists.)
         let (outbox, outbox_rx) = mpsc::channel(OUTBOX_CAPACITY);
         let session = Arc::new(Session {
@@ -323,6 +343,7 @@ impl Session {
             last_rx_ms: AtomicU64::new(0),
             usb_bridge_ports: shared.usb_bridge_ports.clone(),
             usb_peers: shared.usb_peers.clone(),
+            usb_bridge_port,
             sent_icons: Default::default(),
             sent_art: Default::default(),
             notifications_held: Default::default(),
@@ -390,17 +411,19 @@ impl Session {
             })
     }
 
-    /// Whether any QUIC path on this session targets the local loopback port `port`.
-    /// Unlike [`Self::uses_usb_bridge_port`], this does not depend on `usb_peers` or
-    /// `usb_bridge_ports`, so disconnect/replacement teardown can still identify a
-    /// session bound to a USB bridge port that has already been unregistered or replaced.
-    pub(crate) fn has_loopback_path_port(&self, port: u16) -> bool {
-        self.conn.paths().iter().any(|p| {
-            matches!(
-                p.remote_addr(),
-                iroh::TransportAddr::Ip(addr) if addr.ip().to_canonical().is_loopback() && addr.port() == port
-            )
-        })
+    /// Whether this session is bound to the local USB bridge port `port`, either
+    /// recorded when the session was spawned or present on any current QUIC loopback
+    /// path. Unlike [`Self::uses_usb_bridge_port`], this does not depend on `usb_peers`
+    /// or `usb_bridge_ports`, so disconnect/replacement teardown still identifies a
+    /// session bound to a port that has already been unregistered or replaced.
+    pub(crate) fn is_bound_to_usb_bridge_port(&self, port: u16) -> bool {
+        self.usb_bridge_port == Some(port)
+            || self.conn.paths().iter().any(|p| {
+                matches!(
+                    p.remote_addr(),
+                    iroh::TransportAddr::Ip(addr) if addr.ip().to_canonical().is_loopback() && addr.port() == port
+                )
+            })
     }
 
     pub(crate) fn relay_url(&self) -> Option<iroh::RelayUrl> {

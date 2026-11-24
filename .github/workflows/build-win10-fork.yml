@@ -35,7 +35,10 @@ jobs:
           $code = $LASTEXITCODE
           $out | ForEach-Object { Write-Host $_ }
           if ($code -ne 0) {
-            $out | Where-Object { $_ -match 'error(\[E\d+\])?:|FAILED|panicked' } | Select-Object -First 25 | ForEach-Object {
+            ($out | Select-String -Pattern 'error(\[E\d+\])?:|FAILED|panicked at' -Context 0,3 | ForEach-Object {
+              $_.Line
+              $_.Context.PostContext
+            }) | Select-Object -First 35 | ForEach-Object {
               Write-Host "::error::$_"
             }
             exit $code
