@@ -953,12 +953,16 @@ impl Shared {
         if let Some(cb) = pending.on_verified.take() {
             cb();
         }
-        if let Some((old_addr, old_cancel)) =
-            lock(&self.usb_peers).insert(peer, (bridge_addr, pending.cancel))
-            && old_addr != bridge_addr
-        {
-            old_cancel.cancel();
-        }
+        let replaced_port = {
+            let mut peers = lock(&self.usb_peers);
+            match peers.insert(peer, (bridge_addr, pending.cancel)) {
+                Some((old_addr, old_cancel)) if old_addr != bridge_addr => {
+                    old_cancel.cancel();
+                    Some(old_addr.port())
+                }
+                _ => None,
+            }
+        };
         if pending.inbound {
             lock(&self.usb_inbound).insert(peer);
         } else {
@@ -976,10 +980,22 @@ impl Shared {
         self.remember_addrs(&peer, &[bridge_addr]);
         if self.store.is_paired(&peer).unwrap_or(false) {
             self.start_supervisor(peer);
-            self.wake_supervisor(&peer);
             if let Some(session) = self.session(&peer) {
-                self.publish_online(&session);
+                if let Some(old_port) = replaced_port
+                    && session.has_loopback_path_port(old_port)
+                {
+                    tracing::info!(
+                        peer = %peer.short(),
+                        old_port,
+                        new_port = bridge_port,
+                        "closing session on replaced USB tunnel"
+                    );
+                    session.close(CLOSE_NORMAL, b"usb replaced");
+                } else {
+                    self.publish_online(&session);
+                }
             }
+            self.wake_supervisor(&peer);
             self.refresh_capabilities(&peer);
         } else if !pending.inbound && pending.auto_pair {
             let s = self.clone();
@@ -1093,6 +1109,19 @@ impl Shared {
             }
         };
         if !removed {
+            // Even when a newer USB tunnel has already replaced `bridge_addr` in
+            // `usb_peers`, close any session still stranded on the dead port.
+            if let Some(session) = self.session(&peer)
+                && session.has_loopback_path_port(bridge_port)
+            {
+                tracing::info!(
+                    peer = %peer.short(),
+                    port = bridge_port,
+                    "closing session on superseded USB tunnel"
+                );
+                session.close(CLOSE_NORMAL, b"usb disconnected");
+                self.wake_supervisor(&peer);
+            }
             return;
         }
         if !self.store.is_paired(&peer).unwrap_or(false) && !lock(&self.lan_seen).contains_key(&peer) {
@@ -1104,14 +1133,19 @@ impl Shared {
         if let Ok(Some(record)) = self.store.get_peer(&peer) {
             self.remember_addrs(&peer, &record.last_addrs);
         }
-        self.endpoint.network_change().await;
         if let Some(session) = self.session(&peer) {
-            if session.uses_usb_bridge_port(bridge_port) {
+            if session.has_loopback_path_port(bridge_port) {
+                tracing::info!(
+                    peer = %peer.short(),
+                    port = bridge_port,
+                    "closing session on disconnected USB tunnel"
+                );
                 session.close(CLOSE_NORMAL, b"usb disconnected");
             } else {
                 self.publish_online(&session);
             }
         }
+        self.endpoint.network_change().await;
         self.wake_supervisor(&peer);
         self.refresh_capabilities(&peer);
     }

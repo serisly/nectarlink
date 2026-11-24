@@ -390,6 +390,19 @@ impl Session {
             })
     }
 
+    /// Whether any QUIC path on this session targets the local loopback port `port`.
+    /// Unlike [`Self::uses_usb_bridge_port`], this does not depend on `usb_peers` or
+    /// `usb_bridge_ports`, so disconnect/replacement teardown can still identify a
+    /// session bound to a USB bridge port that has already been unregistered or replaced.
+    pub(crate) fn has_loopback_path_port(&self, port: u16) -> bool {
+        self.conn.paths().iter().any(|p| {
+            matches!(
+                p.remote_addr(),
+                iroh::TransportAddr::Ip(addr) if addr.ip().to_canonical().is_loopback() && addr.port() == port
+            )
+        })
+    }
+
     pub(crate) fn relay_url(&self) -> Option<iroh::RelayUrl> {
         if self.has_usb_tunnel() {
             return None;

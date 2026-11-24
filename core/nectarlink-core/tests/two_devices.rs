@@ -8926,3 +8926,222 @@ async fn report_parts_come_at_once_and_logs_only_when_shared() {
     // An answer with no request behind it does nothing.
     with_timeout("unasked", phone.node.diag_log_answer(pc_id, true)).await.unwrap();
 }
+
+/// Spawns a local TCP proxy to `upstream` whose forwarding can either be closed
+/// (simulating an unplugged cable) or blackholed without closing the TCP sockets
+/// (simulating a wedged ADB forward during a brief USB bounce).
+async fn start_controllable_usb_proxy(
+    upstream: SocketAddr,
+) -> (
+    SocketAddr,
+    tokio::sync::oneshot::Sender<()>,
+    tokio::sync::oneshot::Sender<()>,
+) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (blackhole_tx, mut blackhole_rx) = tokio::sync::oneshot::channel::<()>();
+    let (close_tx, close_rx) = tokio::sync::oneshot::channel::<()>();
+    tokio::spawn(async move {
+        let Ok((client, _)) = listener.accept().await else { return };
+        let Ok(server) = tokio::net::TcpStream::connect(upstream).await else { return };
+        let (mut cr, mut cw) = client.into_split();
+        let (mut sr, mut sw) = server.into_split();
+        let blackholed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let bh1 = blackholed.clone();
+        let bh2 = blackholed.clone();
+        let c2s = tokio::spawn(async move {
+            let mut buf = [0u8; 8192];
+            while let Ok(n) = cr.read(&mut buf).await {
+                if n == 0 {
+                    break;
+                }
+                if !bh1.load(std::sync::atomic::Ordering::Relaxed) && sw.write_all(&buf[..n]).await.is_err() {
+                    break;
+                }
+            }
+        });
+        let s2c = tokio::spawn(async move {
+            let mut buf = [0u8; 8192];
+            while let Ok(n) = sr.read(&mut buf).await {
+                if n == 0 {
+                    break;
+                }
+                if !bh2.load(std::sync::atomic::Ordering::Relaxed) && cw.write_all(&buf[..n]).await.is_err() {
+                    break;
+                }
+            }
+        });
+        tokio::select! {
+            _ = &mut blackhole_rx => {
+                blackholed.store(true, std::sync::atomic::Ordering::Relaxed);
+                let _ = close_rx.await;
+            }
+            _ = close_rx => {}
+        }
+        c2s.abort();
+        s2c.abort();
+    });
+    (addr, blackhole_tx, close_tx)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn usb_tunnel_disconnect_closes_stranded_session_immediately() {
+    use nectarlink_core::ConnectionPath;
+
+    let mut phone = start_usb_device("Pixel", DeviceKind::Phone, Some(0), &[]).await;
+    let mut pc = start_usb_device("Desktop", DeviceKind::Desktop, None, &[]).await;
+    let (pc_id, phone_id) = (pc.node.device_id(), phone.node.device_id());
+    let usb_port = phone.node.usb_port().unwrap();
+    let (proxy_addr, _blackhole_tx, close_tx) =
+        start_controllable_usb_proxy(([127, 0, 0, 1], usb_port).into()).await;
+
+    pc.node.connect_usb_tunnel(proxy_addr).await.unwrap();
+    for dev in [&mut pc, &mut phone] {
+        wait_for(dev, "USB pairing prompt", |e| match e {
+            NodeEvent::Pairing(PairingEvent::SasCode { .. }) => Some(()),
+            _ => None,
+        })
+        .await;
+        dev.node.pairing_confirm(true).unwrap();
+    }
+    wait_online(&mut pc, phone_id).await;
+    wait_online(&mut phone, pc_id).await;
+    assert!(matches!(
+        pc.node.paired_devices().unwrap()[0].link,
+        LinkState::Online { path: ConnectionPath::Usb, .. }
+    ));
+
+    // Cut the USB tunnel: `on_usb_tunnel_disconnected` must close the stranded
+    // session immediately rather than waiting 11.5-18.5s for heartbeat timeout.
+    let started = std::time::Instant::now();
+    let _ = close_tx.send(());
+    tokio::time::timeout(Duration::from_secs(4), async {
+        loop {
+            match pc.events.recv().await {
+                Ok(NodeEvent::LinkChanged { device, link: LinkState::Offline { .. } })
+                    if device == phone_id =>
+                {
+                    break;
+                }
+                Ok(_) => {}
+                Err(e) => panic!("event stream failed: {e:?}"),
+            }
+        }
+    })
+    .await
+    .expect("USB session should close immediately on tunnel disconnect without waiting for heartbeat");
+    assert!(
+        started.elapsed() < Duration::from_secs(4),
+        "expected fast USB disconnect teardown, took {:?}",
+        started.elapsed()
+    );
+
+    pc.node.shutdown().await;
+    phone.node.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn usb_tunnel_replacement_switches_session_without_waiting_for_heartbeat() {
+    use nectarlink_core::ConnectionPath;
+
+    let mut phone =
+        start_usb_device("Pixel", DeviceKind::Phone, Some(0), &[nectarlink_core::PHOTOS_READ]).await;
+    let mut pc =
+        start_usb_device("Desktop", DeviceKind::Desktop, None, &[nectarlink_core::PHOTOS_SHOW]).await;
+    let (pc_id, phone_id) = (pc.node.device_id(), phone.node.device_id());
+    let usb_port = phone.node.usb_port().unwrap();
+    let direct_usb: SocketAddr = ([127, 0, 0, 1], usb_port).into();
+    let (proxy_addr, blackhole_tx, _close_tx) = start_controllable_usb_proxy(direct_usb).await;
+
+    pc.node.connect_usb_tunnel(proxy_addr).await.unwrap();
+    for dev in [&mut pc, &mut phone] {
+        wait_for(dev, "USB pairing prompt", |e| match e {
+            NodeEvent::Pairing(PairingEvent::SasCode { .. }) => Some(()),
+            _ => None,
+        })
+        .await;
+        dev.node.pairing_confirm(true).unwrap();
+    }
+    wait_online(&mut pc, phone_id).await;
+    wait_online(&mut phone, pc_id).await;
+    while pc.events.try_recv().is_ok() {}
+    while phone.events.try_recv().is_ok() {}
+
+    // Simulate a fast USB bounce: the old ADB forward stops passing packets
+    // before closing, and a fresh USB tunnel connects immediately.
+    let _ = blackhole_tx.send(());
+    let started = std::time::Instant::now();
+    pc.node.connect_usb_tunnel(direct_usb).await.unwrap();
+
+    // Wait for the replacement session to come online on both sides (well under
+    // the 11.5-18.5s heartbeat).
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let mut saw_offline = false;
+        loop {
+            match pc.events.recv().await {
+                Ok(NodeEvent::LinkChanged { device, link: LinkState::Offline { .. } })
+                    if device == phone_id =>
+                {
+                    saw_offline = true;
+                }
+                Ok(NodeEvent::LinkChanged {
+                    device,
+                    link: LinkState::Online { path: ConnectionPath::Usb, .. },
+                }) if device == phone_id && saw_offline => {
+                    break;
+                }
+                Ok(_) => {}
+                Err(e) => panic!("event stream failed: {e:?}"),
+            }
+        }
+    })
+    .await
+    .expect("USB replacement tunnel should tear down the dead session and reconnect quickly");
+
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match phone.events.recv().await {
+                Ok(NodeEvent::LinkChanged {
+                    device,
+                    link: LinkState::Online { path: ConnectionPath::Usb, .. },
+                }) if device == pc_id => break,
+                Ok(_) => {}
+                Err(e) => panic!("phone event stream failed: {e:?}"),
+            }
+        }
+    })
+    .await
+    .expect("phone should register the replacement USB session quickly");
+
+    // Verify the replacement session actually delivers a phone screenshot right away.
+    let photo = nectarlink_core::Photo {
+        id: "media:wobble".into(),
+        name: "Screenshot_wobble.jpg".into(),
+        size: 12_345,
+        taken: 1_795_514_000,
+        screenshot: true,
+        thumb: vec![0xff, 0xd8, 0xff],
+    };
+    phone.node.photo_taken(photo.clone()).await.unwrap();
+    let got = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match pc.events.recv().await {
+                Ok(NodeEvent::PhotoAdded { device, photo }) if device == phone_id => break photo,
+                Ok(_) => {}
+                Err(e) => panic!("event stream failed: {e:?}"),
+            }
+        }
+    })
+    .await
+    .expect("screenshot taken right after USB replacement should reach PC immediately");
+    assert_eq!(got, photo);
+    assert!(
+        started.elapsed() < Duration::from_secs(6),
+        "expected sub-6s USB wobble recovery + photo delivery, took {:?}",
+        started.elapsed()
+    );
+
+    pc.node.shutdown().await;
+    phone.node.shutdown().await;
+}
