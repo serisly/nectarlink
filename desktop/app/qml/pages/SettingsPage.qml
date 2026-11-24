@@ -1653,7 +1653,22 @@ Item {
 
                         Divider { width: parent.width }
 
-                        // Row 5: Suggest clipboard actions
+                        // Row 5: Auto-copy phone screenshots
+                        ListRow {
+                            width: parent.width
+                            iconPath: Icons.photo
+                            title: qsTr("Copy phone screenshots")
+                            description: qsTr("Automatically copy new screenshots from your phone to the PC clipboard.")
+                            Toggle {
+                                label: qsTr("Copy phone screenshots")
+                                checked: Preferences.autoCopyScreenshots
+                                onToggled: (on) => Preferences.autoCopyScreenshots = on
+                            }
+                        }
+
+                        Divider { width: parent.width }
+
+                        // Row 6: Suggest clipboard actions
                         ListRow {
                             width: parent.width
                             iconPath: Icons.openExternal

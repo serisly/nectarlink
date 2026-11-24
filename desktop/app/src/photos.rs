@@ -84,7 +84,11 @@ pub fn on_event(event: &NodeEvent) {
     let page_device = gallery_state(|s| s.device);
     match event {
         NodeEvent::PhotoAdded { device, photo } => {
-            show(*device, photo);
+            let auto_copy = should_auto_copy_screenshot(photo, crate::settings::auto_copy_screenshots());
+            show(*device, photo, auto_copy);
+            if auto_copy {
+                auto_copy_screenshot(*device, photo.id.clone());
+            }
             if !photo.thumb.is_empty() {
                 let _ = write_thumb(*device, &photo.id, &photo.thumb);
             }
@@ -161,19 +165,39 @@ pub fn handles(transfer_id: &str) -> bool {
     })
 }
 
-fn show(device: DeviceId, photo: &Photo) {
+fn should_auto_copy_screenshot(photo: &Photo, enabled: bool) -> bool {
+    enabled && photo.screenshot
+}
+
+fn auto_copy_screenshot(device: DeviceId, photo_id: String) {
+    let Some(node) = core_host::node() else { return };
+    core_host::spawn(async move {
+        match node.fetch_photos_quietly(device, vec![photo_id.clone()]).await {
+            Ok(transfer) => asked(transfer, Intent::Copy { item_id: Some(photo_id), notify_ui: false }),
+            Err(e) => tracing::warn!(error = %e, "can't auto-copy screenshot"),
+        }
+    });
+}
+
+fn show(device: DeviceId, photo: &Photo, auto_copy: bool) {
     tracing::debug!(
         screenshot = photo.screenshot,
+        auto_copy,
         preview = !photo.thumb.is_empty(),
         "a phone has a new photo"
     );
     let preview = save_preview(device, photo);
     let name = core_host::host().hub.read(|s| s.name_of(&device)).unwrap_or_else(|| "your phone".into());
+    let body = if auto_copy {
+        tr!("Photos", "Copied to clipboard · From %1", name)
+    } else {
+        tr!("Photos", "From %1", name)
+    };
     toast::show(Toast {
         device: TOAST_GROUP.into(),
         key: format!("{device} {}", photo.id),
         title: if photo.screenshot { tr!("Photos", "New screenshot") } else { tr!("Photos", "New photo") },
-        body: tr!("Photos", "From %1", name),
+        body,
         attribution: "NectarLink".into(),
         icon: None,
         image: preview,
@@ -487,16 +511,29 @@ pub(crate) fn free_path(dir: &Path, name: &str) -> PathBuf {
     }
 }
 
-fn copy_file_to_clipboard(path: &Path, remove_after: bool, notify_ui: bool) {
-    let mime = match path.extension().and_then(|e| e.to_str()).map(str::to_ascii_lowercase).as_deref() {
+fn copy_mime_for_path(path: &Path) -> &'static str {
+    match path.extension().and_then(|e| e.to_str()).map(str::to_ascii_lowercase).as_deref() {
         Some("png") => "image/png",
+        Some("webp") => "image/webp",
         _ => "image/jpeg",
-    };
+    }
+}
+
+fn write_photo_to_clipboard(mime: &str, bytes: &[u8]) -> Result<(), String> {
+    #[cfg(windows)]
+    return crate::win::clipboard::write_received_image(mime, bytes);
+    #[cfg(not(windows))]
+    crate::win::clipboard::write_image(mime, bytes)
+}
+
+fn copy_file_to_clipboard(path: &Path, remove_after: bool, notify_ui: bool) {
+    let mime = copy_mime_for_path(path);
     let copied = std::fs::read(path)
         .map_err(|e| e.to_string())
-        .and_then(|bytes| crate::win::clipboard::write_image(mime, &bytes));
+        .and_then(|bytes| write_photo_to_clipboard(mime, &bytes).map(|()| bytes.len()));
     match copied {
-        Ok(()) => {
+        Ok(len) => {
+            tracing::info!(mime, bytes = len, "copied phone photo to clipboard");
             if remove_after {
                 let _ = std::fs::remove_file(path);
             }
@@ -2159,5 +2196,30 @@ mod tests {
 
         // Clean up the static gallery state so tests stay bounded in memory.
         gallery_state(|s| *s = GalleryState::default());
+    }
+
+    #[test]
+    fn auto_copy_screenshot_only_triggers_for_screenshots_when_enabled() {
+        let screenshot = Photo {
+            id: "media:1".into(),
+            name: "Screenshot_20261124.png".into(),
+            size: 1024,
+            taken: 1_700_000_000,
+            screenshot: true,
+            thumb: Vec::new(),
+        };
+        let camera_photo = Photo { screenshot: false, ..screenshot.clone() };
+        assert!(should_auto_copy_screenshot(&screenshot, true));
+        assert!(!should_auto_copy_screenshot(&screenshot, false));
+        assert!(!should_auto_copy_screenshot(&camera_photo, true));
+        assert!(!should_auto_copy_screenshot(&camera_photo, false));
+    }
+
+    #[test]
+    fn copy_mime_for_path_maps_png_webp_and_jpeg() {
+        assert_eq!(copy_mime_for_path(Path::new("Screenshot_1.PNG")), "image/png");
+        assert_eq!(copy_mime_for_path(Path::new("shot.webp")), "image/webp");
+        assert_eq!(copy_mime_for_path(Path::new("IMG_001.jpg")), "image/jpeg");
+        assert_eq!(copy_mime_for_path(Path::new("no_ext")), "image/jpeg");
     }
 }

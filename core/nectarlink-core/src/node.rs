@@ -2364,6 +2364,7 @@ impl Node {
                 crate::session::probe_after_network_change(&shared, &session).await;
             });
         }
+        self.shared.usb_poke.notify_one();
         self.shared.nudge_reconnect();
     }
 
@@ -5154,6 +5155,8 @@ fn install_mdns(shared: &Arc<Shared>, fast: bool) -> Result<()> {
     // mDNS on mobile data would only wake the radio.
     #[cfg(not(target_os = "android"))]
     let builder = builder.multicast_interfaces(is_mdns_interface);
+    #[cfg(windows)]
+    log_windows_mdns_adapters();
     let mdns = builder.build(shared.endpoint.id()).map_err(|e| crate::error::net_chain(&e))?;
     let lookups = shared.endpoint.address_lookup().map_err(crate::error::net)?;
     let cancel = shared.cancel.child_token();
@@ -5243,9 +5246,188 @@ fn carries_multicast(ip: std::net::Ipv4Addr) -> bool {
     interface_carries_multicast(ip, &netdev::get_interfaces())
 }
 
-#[cfg(all(not(target_os = "linux"), not(target_os = "android")))]
+/// On Windows, leave out L3 VPN/TUN adapters (WireGuard, sing-tun, Wintun, PPP),
+/// disconnected NICs, and host-only virtual switches (Hyper-V Default Switch,
+/// WSL, Docker) that carry neither hardware backing nor a default gateway.
+/// Windows reports `IP_ADAPTER_NO_MULTICAST == 0` on many virtual tunnels, so
+/// inspecting adapter type, MAC length, and NDIS hardware/connector flags keeps
+/// mDNS scoped to real LAN interfaces.
+#[cfg(windows)]
+fn carries_multicast(ip: std::net::Ipv4Addr) -> bool {
+    windows_adapter_carries_mdns(ip, &windows_mdns_adapters())
+}
+
+#[cfg(all(not(target_os = "linux"), not(windows), not(target_os = "android")))]
 fn carries_multicast(_ip: std::net::Ipv4Addr) -> bool {
     true
+}
+
+#[cfg(windows)]
+#[derive(Debug, Clone)]
+struct WindowsMdnsAdapter {
+    ipv4s: Vec<std::net::Ipv4Addr>,
+    if_type: u32,
+    oper_up: bool,
+    no_multicast: bool,
+    phys_len: u32,
+    hardware_interface: bool,
+    connector_present: bool,
+    has_gateway: bool,
+}
+
+#[cfg(windows)]
+impl WindowsMdnsAdapter {
+    fn carries_mdns(&self) -> bool {
+        use windows::Win32::NetworkManagement::IpHelper::{
+            IF_TYPE_PPP, IF_TYPE_PROP_VIRTUAL, IF_TYPE_SOFTWARE_LOOPBACK, IF_TYPE_TUNNEL,
+        };
+        if !self.oper_up || self.no_multicast || self.phys_len == 0 {
+            return false;
+        }
+        if matches!(
+            self.if_type,
+            IF_TYPE_PPP | IF_TYPE_SOFTWARE_LOOPBACK | IF_TYPE_PROP_VIRTUAL | IF_TYPE_TUNNEL
+        ) {
+            return false;
+        }
+        // Skip host-only virtual switches (Hyper-V Default Switch, WSL, Docker,
+        // virtual TAPs) that have neither hardware backing nor a default gateway,
+        // while keeping physical LAN/Wi-Fi/USB-tether NICs (even routerless) and
+        // VM guest bridged adapters that carry a default gateway.
+        self.hardware_interface || self.connector_present || self.has_gateway
+    }
+}
+
+/// An address no interface reports (it may just have gone away) stays in, as
+/// before this check. If every adapter would be filtered out (e.g. an isolated
+/// virtual-only lab), keep the address rather than disabling mDNS completely.
+#[cfg(windows)]
+fn windows_adapter_carries_mdns(ip: std::net::Ipv4Addr, adapters: &[WindowsMdnsAdapter]) -> bool {
+    let Some(adapter) = adapters.iter().find(|nic| nic.ipv4s.contains(&ip)) else {
+        return true;
+    };
+    if adapter.carries_mdns() {
+        return true;
+    }
+    !adapters.iter().any(WindowsMdnsAdapter::carries_mdns)
+}
+
+#[cfg(windows)]
+fn log_windows_mdns_adapters() {
+    let adapters = windows_mdns_adapters();
+    let mut active = Vec::new();
+    let mut skipped = Vec::new();
+    for nic in &adapters {
+        for ip in &nic.ipv4s {
+            if ip.is_loopback() || ip.is_link_local() || ip.is_unspecified() {
+                continue;
+            }
+            if windows_adapter_carries_mdns(*ip, &adapters) {
+                active.push(*ip);
+            } else {
+                skipped.push(*ip);
+            }
+        }
+    }
+    tracing::info!(?active, ?skipped, "Windows mDNS interface filter");
+}
+
+#[cfg(windows)]
+#[allow(unsafe_code)]
+fn windows_mdns_adapters() -> Vec<WindowsMdnsAdapter> {
+    use windows::Win32::{
+        Foundation::{ERROR_BUFFER_OVERFLOW, NO_ERROR},
+        NetworkManagement::{
+            IpHelper::{
+                GAA_FLAG_INCLUDE_GATEWAYS, GetAdaptersAddresses, GetIfEntry2, IP_ADAPTER_ADDRESSES_LH,
+                IP_ADAPTER_NO_MULTICAST, MIB_IF_ROW2,
+            },
+            Ndis::IfOperStatusUp,
+        },
+        Networking::WinSock::{AF_INET, SOCKADDR_IN},
+    };
+
+    const MIB_IF_HARDWARE_INTERFACE: u8 = 0x01;
+    const MIB_IF_CONNECTOR_PRESENT: u8 = 0x04;
+
+    let mut len: u32 = 16 * 1024;
+    let mut buf: Vec<u64> = Vec::new();
+    let mut ok = false;
+    for _ in 0..3 {
+        buf.resize((len as usize).div_ceil(std::mem::size_of::<u64>()), 0);
+        // SAFETY: `buf` is 8-byte aligned (satisfies `IP_ADAPTER_ADDRESSES_LH`
+        // alignment) and has at least `len` bytes.
+        let status = unsafe {
+            GetAdaptersAddresses(
+                u32::from(AF_INET.0),
+                GAA_FLAG_INCLUDE_GATEWAYS,
+                None,
+                Some(buf.as_mut_ptr().cast::<IP_ADAPTER_ADDRESSES_LH>()),
+                &mut len,
+            )
+        };
+        if status == NO_ERROR.0 {
+            ok = true;
+            break;
+        }
+        if status != ERROR_BUFFER_OVERFLOW.0 || len == 0 {
+            return Vec::new();
+        }
+    }
+    if !ok || buf.is_empty() {
+        return Vec::new();
+    }
+
+    let mut adapters = Vec::new();
+    let mut cur = buf.as_ptr().cast::<IP_ADAPTER_ADDRESSES_LH>();
+    while !cur.is_null() {
+        // SAFETY: `cur` walks the linked list populated inside `buf` by
+        // `GetAdaptersAddresses`, which succeeded above.
+        let adapter = unsafe { &*cur };
+        let mut ipv4s = Vec::new();
+        let mut ua = adapter.FirstUnicastAddress;
+        while !ua.is_null() {
+            // SAFETY: `ua` walks the adapter's unicast address list inside `buf`.
+            let unicast = unsafe { &*ua };
+            let sa = unicast.Address;
+            if !sa.lpSockaddr.is_null()
+                && usize::try_from(sa.iSockaddrLength).is_ok_and(|n| n >= std::mem::size_of::<SOCKADDR_IN>())
+            {
+                // SAFETY: `lpSockaddr` is non-null and at least `SOCKADDR_IN` bytes.
+                let sin = unsafe { &*sa.lpSockaddr.cast::<SOCKADDR_IN>() };
+                if sin.sin_family == AF_INET {
+                    // SAFETY: `sin_family == AF_INET` guarantees `S_addr` is initialized.
+                    let raw = unsafe { sin.sin_addr.S_un.S_addr };
+                    ipv4s.push(std::net::Ipv4Addr::from(raw.to_ne_bytes()));
+                }
+            }
+            ua = unicast.Next;
+        }
+        if !ipv4s.is_empty() {
+            // SAFETY: `Anonymous2.Flags` is always valid for `IP_ADAPTER_ADDRESSES_LH`.
+            let flags = unsafe { adapter.Anonymous2.Flags };
+            let mut row = MIB_IF_ROW2 { InterfaceLuid: adapter.Luid, ..Default::default() };
+            // SAFETY: `row` is initialized with the adapter's valid `InterfaceLuid`.
+            let (hardware_interface, connector_present) = if unsafe { GetIfEntry2(&mut row) } == NO_ERROR {
+                let bits = row.InterfaceAndOperStatusFlags._bitfield;
+                ((bits & MIB_IF_HARDWARE_INTERFACE) != 0, (bits & MIB_IF_CONNECTOR_PRESENT) != 0)
+            } else {
+                (true, true)
+            };
+            adapters.push(WindowsMdnsAdapter {
+                ipv4s,
+                if_type: adapter.IfType,
+                oper_up: adapter.OperStatus == IfOperStatusUp,
+                no_multicast: (flags & IP_ADAPTER_NO_MULTICAST) != 0,
+                phys_len: adapter.PhysicalAddressLength,
+                hardware_interface,
+                connector_present,
+                has_gateway: !adapter.FirstGatewayAddress.is_null(),
+            });
+        }
+        cur = adapter.Next;
+    }
+    adapters
 }
 
 /// An address no interface reports (it may just have gone away) stays in, as
@@ -5256,6 +5438,90 @@ fn interface_carries_multicast(ip: std::net::Ipv4Addr, interfaces: &[netdev::Int
         .iter()
         .find(|nic| nic.ipv4.iter().any(|net| net.addr() == ip))
         .is_none_or(netdev::Interface::is_multicast)
+}
+
+#[cfg(all(test, windows))]
+mod mdns_windows_interface_tests {
+    use super::{WindowsMdnsAdapter, windows_adapter_carries_mdns};
+    use std::net::Ipv4Addr;
+    use windows::Win32::NetworkManagement::IpHelper::{
+        IF_TYPE_ETHERNET_CSMACD, IF_TYPE_IEEE80211, IF_TYPE_PPP, IF_TYPE_PROP_VIRTUAL, IF_TYPE_TUNNEL,
+    };
+
+    fn adapter(
+        ip: Ipv4Addr,
+        if_type: u32,
+        oper_up: bool,
+        phys_len: u32,
+        hardware: bool,
+        connector: bool,
+        has_gateway: bool,
+    ) -> WindowsMdnsAdapter {
+        WindowsMdnsAdapter {
+            ipv4s: vec![ip],
+            if_type,
+            oper_up,
+            no_multicast: false,
+            phys_len,
+            hardware_interface: hardware,
+            connector_present: connector,
+            has_gateway,
+        }
+    }
+
+    #[test]
+    fn filters_vpn_tunnels_and_host_only_virtual_switches_leaving_wifi() {
+        let wifi = Ipv4Addr::new(192, 168, 1, 118);
+        let wg = Ipv4Addr::new(10, 66, 66, 2);
+        let tun = Ipv4Addr::new(172, 19, 0, 1);
+        let hyperv = Ipv4Addr::new(172, 21, 96, 1);
+        let down_eth = Ipv4Addr::new(192, 168, 50, 1);
+        let adapters = [
+            adapter(wifi, IF_TYPE_IEEE80211, true, 6, true, true, true),
+            adapter(wg, IF_TYPE_PROP_VIRTUAL, true, 0, false, false, true),
+            adapter(tun, IF_TYPE_TUNNEL, true, 0, false, false, false),
+            adapter(hyperv, IF_TYPE_ETHERNET_CSMACD, true, 6, false, false, false),
+            adapter(down_eth, IF_TYPE_ETHERNET_CSMACD, false, 6, true, true, false),
+        ];
+        assert!(windows_adapter_carries_mdns(wifi, &adapters));
+        assert!(!windows_adapter_carries_mdns(wg, &adapters));
+        assert!(!windows_adapter_carries_mdns(tun, &adapters));
+        assert!(!windows_adapter_carries_mdns(hyperv, &adapters));
+        assert!(!windows_adapter_carries_mdns(down_eth, &adapters));
+    }
+
+    #[test]
+    fn keeps_routerless_physical_lan_and_vm_guest_bridged_nic() {
+        let direct_eth = Ipv4Addr::new(192, 168, 50, 1);
+        let vm_bridged = Ipv4Addr::new(10, 0, 2, 15);
+        let ppp = Ipv4Addr::new(10, 8, 0, 2);
+        let adapters = [
+            adapter(direct_eth, IF_TYPE_ETHERNET_CSMACD, true, 6, true, true, false),
+            adapter(vm_bridged, IF_TYPE_ETHERNET_CSMACD, true, 6, false, false, true),
+            adapter(ppp, IF_TYPE_PPP, true, 0, false, false, true),
+        ];
+        assert!(windows_adapter_carries_mdns(direct_eth, &adapters));
+        assert!(windows_adapter_carries_mdns(vm_bridged, &adapters));
+        assert!(!windows_adapter_carries_mdns(ppp, &adapters));
+    }
+
+    #[test]
+    fn no_multicast_flag_is_excluded_when_real_lan_exists() {
+        let lan = Ipv4Addr::new(192, 168, 1, 10);
+        let mut blocked = adapter(Ipv4Addr::new(192, 168, 2, 10), IF_TYPE_ETHERNET_CSMACD, true, 6, true, true, true);
+        blocked.no_multicast = true;
+        let adapters = [adapter(lan, IF_TYPE_ETHERNET_CSMACD, true, 6, true, true, true), blocked];
+        assert!(windows_adapter_carries_mdns(lan, &adapters));
+        assert!(!windows_adapter_carries_mdns(Ipv4Addr::new(192, 168, 2, 10), &adapters));
+    }
+
+    #[test]
+    fn unknown_address_and_all_virtual_fallback_stay_in() {
+        assert!(windows_adapter_carries_mdns(Ipv4Addr::new(10, 0, 0, 5), &[]));
+        let virtual_only = Ipv4Addr::new(172, 21, 96, 1);
+        let adapters = [adapter(virtual_only, IF_TYPE_ETHERNET_CSMACD, true, 6, false, false, false)];
+        assert!(windows_adapter_carries_mdns(virtual_only, &adapters));
+    }
 }
 
 #[cfg(all(test, target_os = "linux"))]

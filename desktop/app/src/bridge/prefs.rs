@@ -134,6 +134,8 @@ pub mod qobject {
         #[qproperty(QString, local_api_token_path)]
         /// Copy received files (<= 10) to the Windows clipboard as CF_HDROP.
         #[qproperty(bool, clipboard_auto_copy_received_files)]
+        /// Automatically copy new phone screenshots to the PC clipboard.
+        #[qproperty(bool, auto_copy_screenshots)]
         /// Open a single file shared from the phone when it arrives.
         #[qproperty(bool, open_shared_files)]
         #[qproperty(bool, sync_wifi_only)]
@@ -445,6 +447,7 @@ pub struct PreferencesRust {
     local_api_private: bool,
     local_api_token_path: QString,
     clipboard_auto_copy_received_files: bool,
+    auto_copy_screenshots: bool,
     open_shared_files: bool,
     sync_wifi_only: bool,
     sync_passwords: bool,
@@ -571,6 +574,7 @@ impl cxx_qt::Initialize for qobject::Preferences {
         let token_path = crate::local_api::token_file_path();
         self.as_mut().set_local_api_token_path(QString::from(&token_path.to_string_lossy().into_owned()));
         self.as_mut().set_clipboard_auto_copy_received_files(settings.clipboard_auto_copy_received_files);
+        self.as_mut().set_auto_copy_screenshots(settings.auto_copy_screenshots);
         self.as_mut().set_open_shared_files(settings.open_shared_files);
         self.as_mut().set_sync_wifi_only(settings.sync_wifi_only);
         self.as_mut().set_sync_passwords(settings.sync_passwords);
@@ -892,6 +896,12 @@ impl cxx_qt::Initialize for qobject::Preferences {
         self.as_mut()
             .on_clipboard_auto_copy_received_files_changed(|p| {
                 crate::settings::set_clipboard_auto_copy_received_files(p.clipboard_auto_copy_received_files);
+                p.save();
+            })
+            .release();
+        self.as_mut()
+            .on_auto_copy_screenshots_changed(|p| {
+                crate::settings::set_auto_copy_screenshots(p.auto_copy_screenshots);
                 p.save();
             })
             .release();
@@ -1460,6 +1470,7 @@ impl qobject::Preferences {
                 .unwrap_or(crate::settings::DEFAULT_LOCAL_API_PORT),
             local_api_private: p.local_api_private,
             clipboard_auto_copy_received_files: p.clipboard_auto_copy_received_files,
+            auto_copy_screenshots: p.auto_copy_screenshots,
             open_shared_files: p.open_shared_files,
             sync_wifi_only: p.sync_wifi_only,
             sync_passwords: p.sync_passwords,

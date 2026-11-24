@@ -172,6 +172,7 @@ fn normalize_webcam_camera(cam: &str) -> String {
 }
 
 static CLIPBOARD_AUTO_COPY_FILES: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+static AUTO_COPY_SCREENSHOTS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static NECTAR_ISLAND: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static STREAM_PC_AUDIO: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static SHARE_PC_STORAGE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -202,6 +203,15 @@ pub fn clipboard_auto_copy_received_files() -> bool {
 
 pub fn set_clipboard_auto_copy_received_files(on: bool) {
     CLIPBOARD_AUTO_COPY_FILES.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether newly taken phone screenshots are automatically copied to the PC clipboard.
+pub fn auto_copy_screenshots() -> bool {
+    AUTO_COPY_SCREENSHOTS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+pub fn set_auto_copy_screenshots(on: bool) {
+    AUTO_COPY_SCREENSHOTS.store(on, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// Whether a single file shared from the phone opens in its default app on arrival.
@@ -751,6 +761,9 @@ pub struct Settings {
     /// Automatically place small incoming received files onto the Windows clipboard (`CF_HDROP`).
     #[serde(default = "default_true", alias = "clipboard_auto_copy_received_files")]
     pub clipboard_auto_copy_received_files: bool,
+    /// Automatically copy newly taken phone screenshots to the PC clipboard.
+    #[serde(default, alias = "auto_copy_screenshots")]
+    pub auto_copy_screenshots: bool,
     /// Open a single photo or document shared from the phone as soon as it
     /// arrives. Off by default: it's saved in Downloads\Nectarlink either way.
     #[serde(default, alias = "open_shared_files")]
@@ -988,6 +1001,7 @@ impl Default for Settings {
             agent_access_enabled: false,
             agent_read_only: false,
             clipboard_auto_copy_received_files: true,
+            auto_copy_screenshots: false,
             open_shared_files: false,
             sync_wifi_only: false,
             sync_passwords: false,
@@ -1075,6 +1089,7 @@ impl Settings {
         #[cfg(windows)]
         crate::win::tray::set_one_colour(self.tray_one_colour);
         set_clipboard_auto_copy_received_files(self.clipboard_auto_copy_received_files);
+        set_auto_copy_screenshots(self.auto_copy_screenshots);
         set_open_shared_files(self.open_shared_files);
         set_sync_wifi_only(self.sync_wifi_only);
         set_sync_passwords(self.sync_passwords);
@@ -1348,6 +1363,7 @@ mod tests {
             agent_access_enabled: true,
             agent_read_only: true,
             clipboard_auto_copy_received_files: false,
+            auto_copy_screenshots: true,
             open_shared_files: true,
             sync_wifi_only: true,
             sync_passwords: true,
@@ -1737,5 +1753,25 @@ mod tests {
         assert_eq!(partial.window_screen.as_deref(), Some("DP-2"));
         assert_eq!(partial.window_x, None);
         assert_eq!(partial.window_y, None);
+    }
+
+    #[test]
+    fn auto_copy_screenshots_defaults_false_and_round_trips() {
+        let dir = tempfile::tempdir().unwrap();
+        let default = Settings::load(dir.path());
+        assert!(!default.auto_copy_screenshots);
+
+        fs::write(dir.path().join(FILE_NAME), r#"{ "autoCopyScreenshots": true }"#).unwrap();
+        let camel = Settings::load(dir.path());
+        assert!(camel.auto_copy_screenshots);
+
+        fs::write(dir.path().join(FILE_NAME), r#"{ "auto_copy_screenshots": true }"#).unwrap();
+        let snake = Settings::load(dir.path());
+        assert!(snake.auto_copy_screenshots);
+
+        snake.apply_runtime();
+        assert!(auto_copy_screenshots());
+        Settings::default().apply_runtime();
+        assert!(!auto_copy_screenshots());
     }
 }

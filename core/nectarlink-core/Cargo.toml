@@ -41,7 +41,14 @@ url.workspace = true
 netdev = { version = "0.46", default-features = false }
 
 [target.'cfg(windows)'.dependencies]
-windows = { workspace = true, features = ["Win32_Foundation", "Win32_Security_Cryptography", "Win32_Storage_FileSystem"] }
+windows = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_NetworkManagement_Ndis",
+    "Win32_Networking_WinSock",
+    "Win32_Security_Cryptography",
+    "Win32_Storage_FileSystem",
+] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
