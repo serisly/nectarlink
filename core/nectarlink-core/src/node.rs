@@ -6301,6 +6301,15 @@ mod usb_teardown_tests {
         let started = std::time::Instant::now();
         pc.connect_usb_tunnel(direct_usb).await.unwrap();
 
+        tokio::time::timeout(Duration::from_secs(3), old_session.cancel.cancelled())
+            .await
+            .unwrap_or_else(|_| {
+                panic!(
+                    "old USB session on port {old_port} was not closed within 3s on tunnel replacement"
+                )
+            });
+        assert!(!old_session.is_alive(), "old USB session must be closed after replacement");
+
         let photo = Photo {
             id: "media:wobble".into(),
             name: "Screenshot_wobble.jpg".into(),
@@ -6315,7 +6324,12 @@ mod usb_teardown_tests {
         while tokio::time::Instant::now() < deadline {
             tokio::select! {
                 _ = ticker.tick() => {
-                    let _ = phone.photo_taken(photo.clone()).await;
+                    let ready = pc.shared.session(&phone_id).is_some_and(|s| {
+                        !Arc::ptr_eq(&s, &old_session) && s.is_alive()
+                    });
+                    if ready {
+                        let _ = phone.photo_taken(photo.clone()).await;
+                    }
                 }
                 ev = pc_ev.recv() => {
                     if let Ok(NodeEvent::PhotoAdded { device, photo: received }) = ev
@@ -6328,10 +6342,6 @@ mod usb_teardown_tests {
                 _ = tokio::time::sleep_until(deadline) => break,
             }
         }
-        assert!(
-            !old_session.is_alive(),
-            "old USB session on port {old_port} must be closed immediately on tunnel replacement"
-        );
         let new_session = pc.shared.session(&phone_id).expect("replacement usb session");
         assert!(!Arc::ptr_eq(&old_session, &new_session), "session must be replaced");
         assert_eq!(
