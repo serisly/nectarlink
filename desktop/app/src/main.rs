@@ -835,6 +835,8 @@ fn main() -> ExitCode {
     recordings::init(&settings);
     send_to::set_enabled(settings.send_to_menu);
     battery::set_enabled(settings.battery_alerts);
+    #[cfg(windows)]
+    win::power::start();
     storage::start();
     folder_sync::start_poller();
     photo_backup::start();
@@ -993,6 +995,8 @@ fn main() -> ExitCode {
     win::ble_beacon::stop();
     webcam::shutdown();
     storage::shutdown();
+    #[cfg(windows)]
+    win::power::stop();
     win::net::stop();
     core_host::shutdown();
     drop(app);

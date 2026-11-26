@@ -112,6 +112,53 @@ impl RecordingFormat {
     }
 }
 
+/// How connected phones warn when this PC loses AC power (Windows).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum PowerLossAlertMode {
+    /// Loud alarm ring (auto-stops on replug or timeout) plus notification banner.
+    #[default]
+    Alarm,
+    /// Notification chime and banner only.
+    Notify,
+}
+
+impl PowerLossAlertMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PowerLossAlertMode::Alarm => "alarm",
+            PowerLossAlertMode::Notify => "notify",
+        }
+    }
+
+    pub fn parse(s: &str) -> Self {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "notify" | "notification" | "chime" => PowerLossAlertMode::Notify,
+            _ => PowerLossAlertMode::Alarm,
+        }
+    }
+
+    fn to_u8(self) -> u8 {
+        match self {
+            PowerLossAlertMode::Alarm => 0,
+            PowerLossAlertMode::Notify => 1,
+        }
+    }
+
+    fn from_u8(v: u8) -> Self {
+        match v {
+            1 => PowerLossAlertMode::Notify,
+            _ => PowerLossAlertMode::Alarm,
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for PowerLossAlertMode {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        Ok(PowerLossAlertMode::parse(&String::deserialize(deserializer).unwrap_or_default()))
+    }
+}
+
 pub const DEFAULT_LOCAL_API_PORT: u16 = 53320;
 pub const DEFAULT_WINDOW_WIDTH: u32 = 1120;
 pub const DEFAULT_WINDOW_HEIGHT: u32 = 740;
@@ -173,6 +220,8 @@ fn normalize_webcam_camera(cam: &str) -> String {
 
 static CLIPBOARD_AUTO_COPY_FILES: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
 static AUTO_COPY_SCREENSHOTS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static POWER_LOSS_ALERT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static POWER_LOSS_ALERT_MODE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 static NECTAR_ISLAND: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static STREAM_PC_AUDIO: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static SHARE_PC_STORAGE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -212,6 +261,32 @@ pub fn auto_copy_screenshots() -> bool {
 
 pub fn set_auto_copy_screenshots(on: bool) {
     AUTO_COPY_SCREENSHOTS.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether paired phones play a warning sound when this PC loses AC power (Windows).
+pub fn power_loss_alert() -> bool {
+    POWER_LOSS_ALERT.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+pub fn set_power_loss_alert(on: bool) {
+    POWER_LOSS_ALERT.store(on, std::sync::atomic::Ordering::Relaxed);
+    #[cfg(windows)]
+    if !on {
+        crate::win::power::stop_active_ring();
+    }
+}
+
+/// How paired phones warn when this PC loses AC power (`Alarm` or `Notify`).
+pub fn power_loss_alert_mode() -> PowerLossAlertMode {
+    PowerLossAlertMode::from_u8(POWER_LOSS_ALERT_MODE.load(std::sync::atomic::Ordering::Relaxed))
+}
+
+pub fn set_power_loss_alert_mode(mode: PowerLossAlertMode) {
+    POWER_LOSS_ALERT_MODE.store(mode.to_u8(), std::sync::atomic::Ordering::Relaxed);
+    #[cfg(windows)]
+    if mode != PowerLossAlertMode::Alarm {
+        crate::win::power::stop_active_ring();
+    }
 }
 
 /// Whether a single file shared from the phone opens in its default app on arrival.
@@ -764,6 +839,12 @@ pub struct Settings {
     /// Automatically copy newly taken phone screenshots to the PC clipboard.
     #[serde(default, alias = "auto_copy_screenshots")]
     pub auto_copy_screenshots: bool,
+    /// Alert paired phones with a warning sound when this PC loses AC power (Windows).
+    #[serde(default, alias = "power_loss_alert")]
+    pub power_loss_alert: bool,
+    /// How paired phones warn on AC power loss: `"alarm"` or `"notify"`.
+    #[serde(default, alias = "power_loss_alert_mode")]
+    pub power_loss_alert_mode: PowerLossAlertMode,
     /// Open a single photo or document shared from the phone as soon as it
     /// arrives. Off by default: it's saved in Downloads\Nectarlink either way.
     #[serde(default, alias = "open_shared_files")]
@@ -1002,6 +1083,8 @@ impl Default for Settings {
             agent_read_only: false,
             clipboard_auto_copy_received_files: true,
             auto_copy_screenshots: false,
+            power_loss_alert: false,
+            power_loss_alert_mode: PowerLossAlertMode::default(),
             open_shared_files: false,
             sync_wifi_only: false,
             sync_passwords: false,
@@ -1090,6 +1173,8 @@ impl Settings {
         crate::win::tray::set_one_colour(self.tray_one_colour);
         set_clipboard_auto_copy_received_files(self.clipboard_auto_copy_received_files);
         set_auto_copy_screenshots(self.auto_copy_screenshots);
+        set_power_loss_alert(self.power_loss_alert);
+        set_power_loss_alert_mode(self.power_loss_alert_mode);
         set_open_shared_files(self.open_shared_files);
         set_sync_wifi_only(self.sync_wifi_only);
         set_sync_passwords(self.sync_passwords);
@@ -1364,6 +1449,8 @@ mod tests {
             agent_read_only: true,
             clipboard_auto_copy_received_files: false,
             auto_copy_screenshots: true,
+            power_loss_alert: true,
+            power_loss_alert_mode: PowerLossAlertMode::Notify,
             open_shared_files: true,
             sync_wifi_only: true,
             sync_passwords: true,
@@ -1773,5 +1860,47 @@ mod tests {
         assert!(auto_copy_screenshots());
         Settings::default().apply_runtime();
         assert!(!auto_copy_screenshots());
+    }
+
+    #[test]
+    fn power_loss_alert_defaults_and_round_trips() {
+        let dir = tempfile::tempdir().unwrap();
+        let default = Settings::load(dir.path());
+        assert!(!default.power_loss_alert);
+        assert_eq!(default.power_loss_alert_mode, PowerLossAlertMode::Alarm);
+
+        fs::write(
+            dir.path().join(FILE_NAME),
+            r#"{ "powerLossAlert": true, "powerLossAlertMode": "notify" }"#,
+        )
+        .unwrap();
+        let camel = Settings::load(dir.path());
+        assert!(camel.power_loss_alert);
+        assert_eq!(camel.power_loss_alert_mode, PowerLossAlertMode::Notify);
+
+        fs::write(
+            dir.path().join(FILE_NAME),
+            r#"{ "power_loss_alert": true, "power_loss_alert_mode": "ALARM" }"#,
+        )
+        .unwrap();
+        let snake = Settings::load(dir.path());
+        assert!(snake.power_loss_alert);
+        assert_eq!(snake.power_loss_alert_mode, PowerLossAlertMode::Alarm);
+
+        fs::write(
+            dir.path().join(FILE_NAME),
+            r#"{ "powerLossAlert": true, "powerLossAlertMode": "unknown_future_mode" }"#,
+        )
+        .unwrap();
+        let fallback = Settings::load(dir.path());
+        assert!(fallback.power_loss_alert);
+        assert_eq!(fallback.power_loss_alert_mode, PowerLossAlertMode::Alarm);
+
+        camel.apply_runtime();
+        assert!(power_loss_alert());
+        assert_eq!(power_loss_alert_mode(), PowerLossAlertMode::Notify);
+        Settings::default().apply_runtime();
+        assert!(!power_loss_alert());
+        assert_eq!(power_loss_alert_mode(), PowerLossAlertMode::Alarm);
     }
 }

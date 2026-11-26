@@ -1520,6 +1520,45 @@ Item {
                             }
                         }
 
+                        Divider { width: parent.width; visible: Qt.platform.os === "windows" }
+
+                        ListRow {
+                            width: parent.width
+                            visible: Qt.platform.os === "windows"
+                            iconPath: Icons.power
+                            title: qsTr("Alert phone when unplugged")
+                            description: qsTr("Play a warning sound on your phone when this PC loses AC power.")
+                            Toggle {
+                                label: qsTr("Alert phone when unplugged")
+                                checked: Preferences.powerLossAlert
+                                onToggled: (on) => Preferences.powerLossAlert = on
+                            }
+                        }
+
+                        Column {
+                            id: powerLossModeBlock
+                            visible: Qt.platform.os === "windows" && Preferences.powerLossAlert
+                            width: parent.width
+                            spacing: 0
+
+                            Divider { width: parent.width }
+
+                            ListRow {
+                                width: parent.width
+                                iconPath: Icons.ring
+                                title: qsTr("Power loss sound")
+                                description: qsTr("Loud alarm rings until plugged back in or dismissed; notification plays your phone's chime.")
+                                Segmented {
+                                    options: [
+                                        { value: "alarm", label: qsTr("Loud alarm") },
+                                        { value: "notify", label: qsTr("Notification chime") }
+                                    ]
+                                    value: Preferences.powerLossAlertMode
+                                    onPicked: (val) => Preferences.powerLossAlertMode = val
+                                }
+                            }
+                        }
+
                         Divider { width: parent.width }
 
                         ListRow {

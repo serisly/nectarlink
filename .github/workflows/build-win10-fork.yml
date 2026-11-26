@@ -58,7 +58,7 @@ jobs:
       - name: Run desktop fork unit tests
         shell: pwsh
         run: |
-          foreach ($filter in @("win::vcam", "pc_audio_stream", "settings::", "photos::")) {
+          foreach ($filter in @("win::vcam", "win::power", "pc_audio_stream", "settings::", "photos::")) {
             Write-Host "=== cargo test $filter ==="
             $out = cargo test --locked -p nectarlink-desktop $filter 2>&1
             $code = $LASTEXITCODE

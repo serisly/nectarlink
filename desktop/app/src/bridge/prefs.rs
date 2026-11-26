@@ -18,7 +18,7 @@ use cxx_qt_lib::{QString, QUrl};
 
 use crate::{
     core_host,
-    settings::{ColorMode, RecordingFormat, Settings, Theme},
+    settings::{ColorMode, PowerLossAlertMode, RecordingFormat, Settings, Theme},
 };
 
 pub use super::deck::DeckControllerRust;
@@ -136,6 +136,10 @@ pub mod qobject {
         #[qproperty(bool, clipboard_auto_copy_received_files)]
         /// Automatically copy new phone screenshots to the PC clipboard.
         #[qproperty(bool, auto_copy_screenshots)]
+        /// Alert paired phones with a warning sound when this PC loses AC power (Windows).
+        #[qproperty(bool, power_loss_alert)]
+        /// How paired phones warn on AC power loss: "alarm" or "notify".
+        #[qproperty(QString, power_loss_alert_mode)]
         /// Open a single file shared from the phone when it arrives.
         #[qproperty(bool, open_shared_files)]
         #[qproperty(bool, sync_wifi_only)]
@@ -448,6 +452,8 @@ pub struct PreferencesRust {
     local_api_token_path: QString,
     clipboard_auto_copy_received_files: bool,
     auto_copy_screenshots: bool,
+    power_loss_alert: bool,
+    power_loss_alert_mode: QString,
     open_shared_files: bool,
     sync_wifi_only: bool,
     sync_passwords: bool,
@@ -575,6 +581,8 @@ impl cxx_qt::Initialize for qobject::Preferences {
         self.as_mut().set_local_api_token_path(QString::from(&token_path.to_string_lossy().into_owned()));
         self.as_mut().set_clipboard_auto_copy_received_files(settings.clipboard_auto_copy_received_files);
         self.as_mut().set_auto_copy_screenshots(settings.auto_copy_screenshots);
+        self.as_mut().set_power_loss_alert(settings.power_loss_alert);
+        self.as_mut().set_power_loss_alert_mode(QString::from(settings.power_loss_alert_mode.as_str()));
         self.as_mut().set_open_shared_files(settings.open_shared_files);
         self.as_mut().set_sync_wifi_only(settings.sync_wifi_only);
         self.as_mut().set_sync_passwords(settings.sync_passwords);
@@ -902,6 +910,19 @@ impl cxx_qt::Initialize for qobject::Preferences {
         self.as_mut()
             .on_auto_copy_screenshots_changed(|p| {
                 crate::settings::set_auto_copy_screenshots(p.auto_copy_screenshots);
+                p.save();
+            })
+            .release();
+        self.as_mut()
+            .on_power_loss_alert_changed(|p| {
+                crate::settings::set_power_loss_alert(p.power_loss_alert);
+                p.save();
+            })
+            .release();
+        self.as_mut()
+            .on_power_loss_alert_mode_changed(|p| {
+                let mode = PowerLossAlertMode::parse(&String::from(&p.power_loss_alert_mode));
+                crate::settings::set_power_loss_alert_mode(mode);
                 p.save();
             })
             .release();
@@ -1471,6 +1492,8 @@ impl qobject::Preferences {
             local_api_private: p.local_api_private,
             clipboard_auto_copy_received_files: p.clipboard_auto_copy_received_files,
             auto_copy_screenshots: p.auto_copy_screenshots,
+            power_loss_alert: p.power_loss_alert,
+            power_loss_alert_mode: PowerLossAlertMode::parse(&String::from(&p.power_loss_alert_mode)),
             open_shared_files: p.open_shared_files,
             sync_wifi_only: p.sync_wifi_only,
             sync_passwords: p.sync_passwords,
