@@ -10,7 +10,7 @@ use std::{
         Mutex, OnceLock,
         atomic::{AtomicIsize, AtomicU64, Ordering},
     },
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use nectarlink_core::{DeviceId, DeviceKind, LinkState};
@@ -98,7 +98,6 @@ pub enum SampleOutcome {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct PendingUnplug {
-    since: Instant,
     battery_percent: Option<u8>,
     generation: u64,
 }
@@ -121,7 +120,7 @@ impl PowerMonitorState {
     }
 
     /// Processes a new power status reading (e.g. on `PBT_APMPOWERSTATUSCHANGE`).
-    pub fn on_sample(&mut self, sample: PowerSnapshot, now: Instant) -> SampleOutcome {
+    pub fn on_sample(&mut self, sample: PowerSnapshot) -> SampleOutcome {
         match sample.ac {
             AcState::Unknown => SampleOutcome::None,
             AcState::Offline => match self.stable_ac {
@@ -140,7 +139,6 @@ impl PowerMonitorState {
                         self.generation = self.generation.wrapping_add(1);
                         let generation = self.generation;
                         self.pending_unplug = Some(PendingUnplug {
-                            since: now,
                             battery_percent: sample.battery_percent,
                             generation,
                         });
@@ -197,10 +195,10 @@ impl PowerMonitorState {
         }
     }
 
-    /// Returns the instant at which a pending unplug debounce was started, if any.
+    /// Returns the generation of a pending unplug debounce, if any.
     #[cfg(test)]
-    pub fn pending_since(&self) -> Option<Instant> {
-        self.pending_unplug.map(|p| p.since)
+    pub fn pending_generation(&self) -> Option<u64> {
+        self.pending_unplug.map(|p| p.generation)
     }
 }
 
@@ -368,7 +366,7 @@ fn on_power_status_broadcast() {
     let Some(snapshot) = query_system_power() else { return };
     let outcome = {
         let mut state = monitor_state().lock().unwrap_or_else(|e| e.into_inner());
-        state.on_sample(snapshot, Instant::now())
+        state.on_sample(snapshot)
     };
     tracing::debug!(
         ac = ?snapshot.ac,
@@ -563,11 +561,10 @@ mod tests {
 
     #[test]
     fn unplug_requires_debounce_then_fires_once_until_replugged() {
-        let t0 = Instant::now();
         let mut state = PowerMonitorState::new(Some(snap(AcState::Online, Some(90))), UNPLUG_DEBOUNCE);
 
         // Online -> Offline schedules debounce.
-        let out = state.on_sample(snap(AcState::Offline, Some(89)), t0);
+        let out = state.on_sample(snap(AcState::Offline, Some(89)));
         let gen1 = match out {
             SampleOutcome::ScheduleDebounce { generation, delay } => {
                 assert_eq!(delay, UNPLUG_DEBOUNCE);
@@ -577,8 +574,8 @@ mod tests {
         };
 
         // Duplicate Offline broadcasts during debounce update battery % without resetting the timer.
-        assert_eq!(state.on_sample(snap(AcState::Offline, Some(88)), t0 + Duration::from_millis(500)), SampleOutcome::None);
-        assert_eq!(state.pending_since(), Some(t0));
+        assert_eq!(state.on_sample(snap(AcState::Offline, Some(88))), SampleOutcome::None);
+        assert_eq!(state.pending_generation(), Some(gen1));
 
         // Debounce fires while still Offline -> emits Unplugged with freshest battery %.
         assert_eq!(
@@ -587,39 +584,35 @@ mod tests {
         );
 
         // Further battery drops while still Offline do NOT re-trigger.
-        assert_eq!(state.on_sample(snap(AcState::Offline, Some(86)), t0 + Duration::from_secs(10)), SampleOutcome::None);
-        assert_eq!(state.on_sample(snap(AcState::Offline, Some(85)), t0 + Duration::from_secs(20)), SampleOutcome::None);
+        assert_eq!(state.on_sample(snap(AcState::Offline, Some(86))), SampleOutcome::None);
+        assert_eq!(state.on_sample(snap(AcState::Offline, Some(85))), SampleOutcome::None);
 
         // Replugging emits Replugged immediately.
         assert_eq!(
-            state.on_sample(snap(AcState::Online, Some(85)), t0 + Duration::from_secs(25)),
+            state.on_sample(snap(AcState::Online, Some(85))),
             SampleOutcome::Emit(PowerTransition::Replugged { battery_percent: Some(85) })
         );
 
         // Subsequent Online samples are no-ops.
-        assert_eq!(state.on_sample(snap(AcState::Online, Some(86)), t0 + Duration::from_secs(30)), SampleOutcome::None);
+        assert_eq!(state.on_sample(snap(AcState::Online, Some(86))), SampleOutcome::None);
     }
 
     #[test]
     fn transient_flicker_within_debounce_cancels_alert_and_invalidates_old_timer() {
-        let t0 = Instant::now();
         let mut state = PowerMonitorState::new(Some(snap(AcState::Online, Some(100))), UNPLUG_DEBOUNCE);
 
-        let gen1 = match state.on_sample(snap(AcState::Offline, Some(99)), t0) {
+        let gen1 = match state.on_sample(snap(AcState::Offline, Some(99))) {
             SampleOutcome::ScheduleDebounce { generation, .. } => generation,
             other => panic!("expected ScheduleDebounce, got {other:?}"),
         };
 
-        // Charger bounces back to Online after 500ms -> cancels debounce.
-        assert_eq!(
-            state.on_sample(snap(AcState::Online, Some(99)), t0 + Duration::from_millis(500)),
-            SampleOutcome::CancelDebounce
-        );
+        // Charger bounces back to Online before debounce expires -> cancels debounce.
+        assert_eq!(state.on_sample(snap(AcState::Online, Some(99))), SampleOutcome::CancelDebounce);
         // Stale timer callback from gen1 does nothing.
         assert_eq!(state.on_debounce_fired(gen1, Some(snap(AcState::Offline, Some(99)))), None);
 
         // Second real unplug gets a fresh generation; old gen1 still cannot trigger it.
-        let gen2 = match state.on_sample(snap(AcState::Offline, Some(98)), t0 + Duration::from_secs(1)) {
+        let gen2 = match state.on_sample(snap(AcState::Offline, Some(98))) {
             SampleOutcome::ScheduleDebounce { generation, .. } => generation,
             other => panic!("expected ScheduleDebounce, got {other:?}"),
         };
@@ -633,20 +626,19 @@ mod tests {
 
     #[test]
     fn starting_on_battery_does_not_false_alarm_until_plugged_and_unplugged_again() {
-        let t0 = Instant::now();
         let mut state = PowerMonitorState::new(Some(snap(AcState::Offline, Some(60))), UNPLUG_DEBOUNCE);
 
         // Already on battery -> Offline broadcasts do nothing.
-        assert_eq!(state.on_sample(snap(AcState::Offline, Some(59)), t0), SampleOutcome::None);
+        assert_eq!(state.on_sample(snap(AcState::Offline, Some(59))), SampleOutcome::None);
 
         // Plugging in transitions Offline -> Online.
         assert_eq!(
-            state.on_sample(snap(AcState::Online, Some(59)), t0 + Duration::from_secs(5)),
+            state.on_sample(snap(AcState::Online, Some(59))),
             SampleOutcome::Emit(PowerTransition::Replugged { battery_percent: Some(59) })
         );
 
         // Now unplugging schedules debounce and fires normally.
-        let gen1 = match state.on_sample(snap(AcState::Offline, Some(58)), t0 + Duration::from_secs(10)) {
+        let gen1 = match state.on_sample(snap(AcState::Offline, Some(58))) {
             SampleOutcome::ScheduleDebounce { generation, .. } => generation,
             other => panic!("expected ScheduleDebounce, got {other:?}"),
         };
@@ -658,21 +650,20 @@ mod tests {
 
     #[test]
     fn unknown_samples_and_online_recheck_suppress_false_alarms() {
-        let t0 = Instant::now();
         let mut state = PowerMonitorState::new(None, UNPLUG_DEBOUNCE);
 
         // Unknown readings never arm or fire anything.
-        assert_eq!(state.on_sample(snap(AcState::Unknown, None), t0), SampleOutcome::None);
+        assert_eq!(state.on_sample(snap(AcState::Unknown, None)), SampleOutcome::None);
 
         // First real reading seeds Online cleanly.
-        assert_eq!(state.on_sample(snap(AcState::Online, Some(80)), t0), SampleOutcome::None);
+        assert_eq!(state.on_sample(snap(AcState::Online, Some(80))), SampleOutcome::None);
 
         // Unplug scheduled, Unknown in between is ignored, live re-check sees Online -> suppressed.
-        let gen1 = match state.on_sample(snap(AcState::Offline, Some(79)), t0 + Duration::from_secs(1)) {
+        let gen1 = match state.on_sample(snap(AcState::Offline, Some(79))) {
             SampleOutcome::ScheduleDebounce { generation, .. } => generation,
             other => panic!("expected ScheduleDebounce, got {other:?}"),
         };
-        assert_eq!(state.on_sample(snap(AcState::Unknown, None), t0 + Duration::from_secs(2)), SampleOutcome::None);
+        assert_eq!(state.on_sample(snap(AcState::Unknown, None)), SampleOutcome::None);
         assert_eq!(state.on_debounce_fired(gen1, Some(snap(AcState::Online, Some(80)))), None);
     }
 
